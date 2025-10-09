@@ -1,0 +1,126 @@
+After initial setup each time:
+module load miniconda/25.3.1
+module load cuda/12.2
+module load libvips/8.13.0
+conda activate cellvit_env
+
+python3 check_environment.py
+
+
+
+
+<<<<<<<<<<<<<<<<<<<<<<<<<<
+
+Commands for conda and cuda setup (inital setup, one time)
+Following the readme.md and scc modules for conda
+
+Python3 module is conflicting with conda
+That's why I had to do: 
+module unload python3
+module load miniconda/25.3.1
+
+setup_scc_condarc.sh
+conda --version
+conda env create -f environment_verbose.yaml
+conda activate cellvit_env
+pip install -r requirements.txt
+
+
+Check GPUs:
+lspci | grep -i nvidia
+module list
+module avail cuda
+module load cuda/12.2
+nvcc --version
+nvidia-smi
+
+Based on the outputs: Tesla GPUs etc. we can use
+pip install torch==2.2.2 torchvision==0.17.2 torchaudio==2.2.2 --index-url https://download.pytorch.org/whl/cu121
+
+Somehow libvips module was not loaded, so I ran:
+module load libvips/8.13.0
+
+Run:
+python3 check_environment.py
+
+It should say success for everything
+
+For datasets of the examples:
+python3 ./cellvit/utils/download_example_files.py
+
+Testing examples:
+
+python3 ./cellvit/detect_cells.py \
+  --model ./checkpoints/HIPT-256/CellViT-256-x40-AMP.pth \
+  --outdir ./test-results/x_40/compression \
+  --geojson \
+  --compression \
+  --graph \
+  process_wsi \
+  --wsi_path ./test_database/x40_svs/JP2K-33003-2.svs
+
+  python3 ./cellvit/detect_cells.py \
+  --model ./checkpoints/SAM/CellViT-SAM-H-x40-AMP.pth \
+  --outdir ./test-results/x_40/compression \
+  --geojson \
+  --compression \
+  --graph \
+  process_wsi \
+  --wsi_path ./test_database/x40_svs/JP2K-33003-2.svs
+
+
+  <<<<<<<<<<<<<<<<<<<<<<<
+
+  Wandb connection
+
+  wandb login
+
+  # Change the config to online (from offline)
+  # Check the path to the weights (pth)
+
+  Running the classifier head
+
+  # make the logs folder
+mkdir logs_local
+
+# run the sweep: you need to login to wandb to use this feature (option 1 or 2 when promped, not 3 (Don't visualize my results)
+python3 ./cellvit/train_cell_classifier_head.py --config ./test_database/training_database/Example-Detection/train_configs/ViT256/fold_0_sweep.yaml --sweep
+
+# find your best configuration
+python3 ./scripts/find_best_hyperparameter.py /path/to/your/sweep --metric AUROC/Validation
+
+# run evaluation on test set
+python3 ./cellvit/training/evaluate/inference_cellvit_experiment_detection.py \
+  --logdir /path/to/your/run_log \
+  --dataset_path ./test_database/training_database/Example-Detection \
+  --cellvit_path ./checkpoints/CellViT-256-x40-AMP.pth \
+  --input_shape 256 256
+# Be aware to give the correct input shape as used for training
+
+
+Change our dataset structure (and resolution) to the same structure with the config etc.
+
+Then we can do a sweep for hyperparameter tuning
+
+
+<<<<<<<<<<<<<<<<<<<<<<<
+
+Running classifier head with Google Drive Training dataset
+
+python3 ./cellvit/train_cell_classifier_head.py --config /projectnb/ec500kb/projects/Fall_2025_Projects/Project_2/AI-guided-whole-slide-imaging-analysis/ProcessedData_npy/train_configs/fold_new_dataset.yaml
+
+python3 ./cellvit/train_cell_classifier_head.py --config ./test_database/training_database/Example-Detection/train_configs/ViT256/fold_0.yaml
+
+
+TCGA-D8-A1X5-01Z-00-DX2_4_512_0 this image didn't have any cells.
+
+
+Potential bugs/debugging:
+
+Delete cache
+
+
+
+
+
+

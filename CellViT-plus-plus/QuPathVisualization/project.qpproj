@@ -1,0 +1,24 @@
+{
+  "version": "0.5.1",
+  "createTimestamp": 1759861353548,
+  "modifyTimestamp": 1759861353548,
+  "uri": "file:/projectnb/ec500kb/projects/Fall_2025_Projects/Project_2/AI-guided-whole-slide-imaging-analysis/CellViT-plus-plus/QuPathVisualization/project.qpproj",
+  "lastID": 1,
+  "images": [
+    {
+      "serverBuilder": {
+        "builderType": "uri",
+        "providerClassName": "qupath.lib.images.servers.bioformats.BioFormatsServerBuilder",
+        "uri": "file:/projectnb/ec500kb/projects/Fall_2025_Projects/Project_2/AI-guided-whole-slide-imaging-analysis/CellViT-plus-plus/test_database/x40_svs/JP2K-33003-2.svs",
+        "args": [
+          "--series",
+          "0"
+        ]
+      },
+      "entryID": 1,
+      "randomizedName": "daa48bcc-a48d-463a-a32c-db5ed4088c33",
+      "imageName": "JP2K-33003-2.svs",
+      "metadata": {}
+    }
+  ]
+}
