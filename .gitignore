@@ -207,9 +207,8 @@ marimo/_lsp/
 __marimo__/
 
 
-ProcessedData/*
-!ProcessedData/**/*.ipynb
-!ProcessedData/*.ipynb
-!ProcessedData/README.md
-!ProcessedData/**/*.txt
-!ProcessedData/**/*.py
+*.png
+*.jpg
+*.jpeg
+*.csv
+*.npy
