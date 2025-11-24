@@ -1,0 +1,142 @@
+# ===============================
+# Fine-tuning CellViT on TCGA Patches
+# ===============================
+
+
+random_seed: 19
+gpu: 0
+
+data:
+  dataset: PanNuke
+  dataset_path: /projectnb/ec500kb/projects/Fall_2025_Projects/Project_2/AI-guided-whole-slide-imaging-analysis/ProcessedDataset/v1_40x_area20/patches_cellvit_p256_pannuke
+  input_shape: 256
+  train_folds: [0]
+  val_folds: [1]
+  num_nuclei_classes: 6
+  num_tissue_classes: 1
+  #val_patch_size: 256
+
+dataloader:
+  train:
+    num_workers: 6        # try 4–8; lower if the node is busy
+    pin_memory: true
+    persistent_workers: true
+    drop_last: true       # avoids tiny tail batches
+  val:
+    num_workers: 4
+    pin_memory: true
+    persistent_workers: true
+    drop_last: true
+
+model:
+  backbone: Sam-h
+  pretrained_encoder: /projectnb/ec500kb/projects/Fall_2025_Projects/Project_2/AI-guided-whole-slide-imaging-analysis/CellViT-plus-plus/checkpoints/SAM/encoder_only_CellViT-SAM-H-x40-AMP.pth
+  #pretrained_encoder: /projectnb/ec500kb/projects/Fall_2025_Projects/Project_2/AI-guided-whole-slide-imaging-analysis/CellViT-plus-plus/checkpoints/Virchow/CellViT-Virchow-x40-AMP.pth
+training:
+  drop_rate: 0
+  attn_drop_rate: 0.1
+  drop_path_rate: 0.1
+  batch_size: 2
+  epochs: 80
+  optimizer: AdamW
+  early_stopping_patience: 80
+  scheduler:
+    scheduler_type: cosine
+    warmup_epochs: 2
+  optimizer_hyperparameter:
+    lr: 0.00003
+  unfreeze_epoch: 0
+  sampling_strategy: random
+  eval_every: 1 # Ideally we want to set 1 but it gives memory issues
+  mixed_precision: true
+  resume: true
+  
+
+# For starting from a checkpoint
+checkpoint: /projectnb/ec500kb/projects/Fall_2025_Projects/Project_2/AI-guided-whole-slide-imaging-analysis/ProcessedDataset/v1_40x_area20/patches_cellvit_p128_pannuke/logs_local/2025-11-13T173728_tcga_finetune_128/checkpoints/model_best.pth
+just_load_model: false
+
+
+loss:
+  nuclei_type_map:
+    bce:
+      loss_fn: xentropy_loss
+      weight: 0.5
+    dice:
+      loss_fn: dice_loss
+      weight: 0.2
+    mcfocaltverskyloss:
+      loss_fn: MCFocalTverskyLoss
+      weight: 0.5
+      args:
+        num_classes: 6
+
+transformations:
+  randomrotate90:
+    p: 0.5
+  horizontalflip:
+    p: 0.5
+  verticalflip:
+    p: 0.5
+  downscale:
+    p: 0.15
+    scale: 0.5
+  blur:
+    p: 0.2
+    blur_limit: 10
+  gaussnoise:
+    p: 0.25
+    var_limit: 50
+  colorjitter:
+    p: 0.2
+    scale_setting: 0.25
+    scale_color: 0.1
+  superpixels:
+    p: 0.1
+  zoomblur:
+    p: 0.1
+  randomsizedcrop:
+    p: 0.1
+  elastictransform:
+    p: 0.2
+  normalize:
+    mean:
+    - 0.5
+    - 0.5
+    - 0.5
+    std:
+    - 0.5
+    - 0.5
+    - 0.5
+
+eval_checkpoint: null #For finetuning we need this null
+run_sweep: false
+agent: null
+
+dataset_config:
+  tissue_types:
+    Lung: 0
+  nuclei_types:
+    background: 0
+    epithelial: 1
+    lymphocyte: 2
+    macrophage: 3
+    neutrophil: 4
+    other: 5
+
+
+
+# --- Logging ---
+logging:
+  project: CellViT_segmentation_256
+  mode: online                  # or 'offline' if no internet
+  wandb_dir: /projectnb/ec500kb/projects/Fall_2025_Projects/Project_2/AI-guided-whole-slide-imaging-analysis/ProcessedDataset/v1_40x_area20/patches_cellvit_p256_pannuke/logs_local
+  log_dir: /projectnb/ec500kb/projects/Fall_2025_Projects/Project_2/AI-guided-whole-slide-imaging-analysis/ProcessedDataset/v1_40x_area20/patches_cellvit_p256_pannuke/logs_local
+  notes: Full CellViT fine-tune on TCGA lung tissue patches
+  log_comment: tcga_finetune_256_reheat
+  level: debug
+  log_images: true
+
+
+  
+

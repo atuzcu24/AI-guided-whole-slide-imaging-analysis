@@ -1,0 +1,5 @@
+I made the simple changes to the notebooks just need access to the environment
+
+Chose not to run on base miniconda to avoid breaking key dependencies currently in environment
+
+Once access is given will run job and check results
