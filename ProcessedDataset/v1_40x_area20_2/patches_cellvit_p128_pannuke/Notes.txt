@@ -1,0 +1,59 @@
+conda env:
+
+miniconda/25.3.1, cuda/12.2, libvips/8.13.0
+
+conda activate cellvit_env
+
+Connect to wandb
+
+Running:
+python3 ../../CellViT-plus-plus/cellvit/train_cellvit.py   --config /patches_cellvit_p128_pannuke/train_configs/cellvit_segmentation.yaml
+
+
+After first 58 epoch training it hit early stopping. I think it is due to learning rate getting too small, due to scheduler.
+
+I'll start from that checkpoint: /projectnb/ec500kb/projects/Fall_2025_Projects/Project_2/AI-guided-whole-slide-imaging-analysis/ProcessedDataset/v1_40x_area20/patches_cellvit_p128_pannuke/logs_local/2025-11-13T173728_tcga_finetune_128/checkpoints/model_best.pth
+
+And make these changes:
+
+lr = 3e-5 (prev it was 1e-5)
+
+warmup_epochs: 2
+
+early_stopping_patience: 80 (whole number of epochs)
+
+After this I am planning to further finetune with a smaller learning rate:
+
+!! Important, I understood that we need the preencoder (and extract the encoder part from the checkpoints that they gave us) using notebook 7.
+
+Next steps:
+
+We'll create 256 patches (because that's what virchow uses)
+We'll create the encoder for virchow
+We'll train (only the decoder maybe), freezing the encoder the virchow to finetune for our model.
+
+Then we should be ready to go for fusion.
+
+Virchow:
+We don't currently have virchow2
+
+We can add their paper as a reference too: https://arxiv.org/pdf/2408.00738
+
+
+Next steps:
+
+1- Git cleaning
+Move notebooks under AI-GUIDED-CLEAN
+Add checkpoints to the new Cellvit-plus-plus
+Push these changes
+
+2- Create patches
+1- Decide whether to use 128 or 256
+2- Rerun the notebook b's to create the patches again
+3- Create the folder (again), using Fold0, fold1 etc. similar to the example folder structure
+4- Rerun the training, to make sure it is working correctly
+
+3- Early fusion create cellvit_sam_rosie_film.py etc. and try early fusion
+Push everything to Git!
+
+
