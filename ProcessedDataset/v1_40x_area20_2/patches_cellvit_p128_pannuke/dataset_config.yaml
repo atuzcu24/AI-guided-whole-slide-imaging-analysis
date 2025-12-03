@@ -1,0 +1,16 @@
+# Basic dataset configuration for CellViT TCGA fine-tuning
+name: TCGA
+magnification: 40
+patch_size: 128
+num_classes: 1
+stain_normalized: false
+description: "TCGA Lung patches prepared for CellViT fine-tuning"
+tissue_types:
+  Lung: 0
+nuclei_types:
+  background: 0
+  epithelial: 1
+  lymphocyte: 2
+  macrophage: 3
+  neutrophil: 4
+  other: 5 #TODO can we get rid of this?
