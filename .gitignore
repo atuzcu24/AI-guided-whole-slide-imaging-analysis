@@ -212,3 +212,14 @@ __marimo__/
 *.jpeg
 *.csv
 *.npy
+
+!ProcessedDataset/**/train_configs/*.yaml
+!ProcessedDataset/**/*.yaml
+!ProcessedDataset/**/*.txt
+!ProcessedDataset/**/.gitkeep
+
+# Ignore model weights and checkpoints
+*.pth
+*.pt
+checkpoints/
+**/checkpoints/*.pth
