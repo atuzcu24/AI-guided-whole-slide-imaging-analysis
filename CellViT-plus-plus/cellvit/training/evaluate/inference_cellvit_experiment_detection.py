@@ -416,7 +416,7 @@ class CellViTInfExpDetection(CellViTClassifierInferenceExperiment):
         )
         label_map = self.run_conf["data"]["label_map"]
         label_map = {int(k): v for k, v in label_map.items()}
-        conf_matrix.relabel(label_map)
+        #conf_matrix.relabel(label_map) #Be careful about relabeling here, may need to comment this part for inference
         conf_matrix.save_stat(
             str(test_result_dir / "confusion_matrix_summary"), summary=True
         )
