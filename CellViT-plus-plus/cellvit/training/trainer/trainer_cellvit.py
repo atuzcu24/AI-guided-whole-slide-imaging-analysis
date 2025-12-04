@@ -27,6 +27,43 @@ from cellvit.training.base_ml.base_early_stopping import EarlyStopping
 from cellvit.training.base_ml.base_trainer import BaseTrainer
 from cellvit.training.utils.metrics import get_fast_pq, remap_label
 from cellvit.training.utils.tools import AverageMeter, cropping_center
+# --- Visualization helper ---
+import os
+import matplotlib.pyplot as plt
+import numpy as np
+import cv2
+
+# --- add at top of file ---
+from PIL import Image
+
+def save_val_preview(inputs, outputs, gts, epoch, save_dir, num_classes=6, index=0):
+    os.makedirs(save_dir, exist_ok=True)
+
+    img = inputs[0].detach().cpu().permute(1, 2, 0).numpy()
+    img = ((img * 0.5) + 0.5).clip(0, 1)  # de-normalize to [0,1]
+
+    gt_type   = torch.argmax(gts["nuclei_type_map"],   dim=1)[0].detach().cpu().numpy()
+    pred_type = torch.argmax(outputs["nuclei_type_map"], dim=1)[0].detach().cpu().numpy()
+
+    # ----- 1) RAW IDs (.npy) -----
+    stem = f"epoch_{epoch:03d}_idx_{index:02d}"
+    np.save(Path(save_dir) / f"{stem}_pred_type.npy", pred_type.astype(np.uint8))
+
+    # ----- 2) Colored PNG for quick QC -----
+    denom = max(num_classes - 1, 1)
+    colored = (plt.get_cmap("tab10")(pred_type / denom)[:, :, :3] * 255).astype(np.uint8)
+    Image.fromarray(colored).save(Path(save_dir) / f"{stem}_pred_type.png")
+
+    # ----- 3) (Optional) Overlay on input -----
+    base_rgb  = (img * 255).astype(np.uint8)
+    base_rgba = Image.fromarray(base_rgb).convert("RGBA")
+    mask_rgba = Image.fromarray(colored).convert("RGBA")
+    mask_rgba.putalpha(110)  # ~43% opacity
+    overlay = Image.alpha_composite(base_rgba, mask_rgba).convert("RGB")
+    overlay.save(Path(save_dir) / f"{stem}_overlay.png")
+
+
+
 
 
 class CellViTTrainer(BaseTrainer):
@@ -100,6 +137,7 @@ class CellViTTrainer(BaseTrainer):
         self.dataset_config = dataset_config
         self.tissue_types = dataset_config["tissue_types"]
         self.reverse_tissue_types = {v: k for k, v in self.tissue_types.items()}
+        self.tissue_types_lower = {k.lower(): v for k, v in self.tissue_types.items()}
         self.nuclei_types = dataset_config["nuclei_types"]
         self.magnification = magnification
 
@@ -329,10 +367,15 @@ class CellViTTrainer(BaseTrainer):
             select_example_image = None
 
         val_loop = tqdm.tqdm(enumerate(val_dataloader), total=len(val_dataloader))
+        chosen_batch = None
+
 
         with torch.no_grad():
             for batch_idx, batch in val_loop:
                 return_example_images = batch_idx == select_example_image
+                if return_example_images:
+                    chosen_batch = batch
+
                 batch_metrics, example_img = self.validation_step(
                     batch, batch_idx, return_example_images
                 )
@@ -357,6 +400,38 @@ class CellViTTrainer(BaseTrainer):
                         "Pred-Acc": np.round(self.batch_avg_tissue_acc.avg, 3),
                     }
                 )
+        # --- Save K validation previews from the chosen batch (once per epoch) ---
+        try:
+            if self.log_images and chosen_batch is not None:
+                imgs = chosen_batch[0].to(self.device)
+                masks = chosen_batch[1]
+                tissue_types = chosen_batch[2]
+
+                with torch.no_grad():
+                    preds_raw = self.model.forward(imgs)
+                    preds = self.unpack_predictions(preds_raw)
+                    gt    = self.unpack_masks(masks=masks, tissue_types=tissue_types)
+
+                pred_tensors = {k: v for k, v in preds.get_dict().items() if torch.is_tensor(v)}
+                gt_tensors   = {k: v for k, v in gt.get_dict().items()    if torch.is_tensor(v)}
+
+                K = min(3, imgs.shape[0])  # set to 1 if you want just one preview
+                save_dir = str(Path(self.logdir) / "val_previews")
+                for i in range(K):
+                    save_val_preview(
+                        inputs=imgs[i:i+1].detach().cpu(),  # (1, 3, H, W)
+                        outputs={k: v[i:i+1] for k, v in pred_tensors.items()},
+                        gts={k: v[i:i+1] for k, v in gt_tensors.items()},
+                        epoch=epoch,
+                        save_dir=save_dir,
+                        num_classes=self.num_classes,
+                        index=i,
+                    )
+        except Exception as e:
+            self.logger.warning(f"⚠️ Failed to save val previews: {e}")
+
+
+
         tissue_types_val = [
             self.reverse_tissue_types[t].lower() for t in np.concatenate(tissue_gt)
         ]
@@ -451,6 +526,7 @@ class CellViTTrainer(BaseTrainer):
 
         self.model.zero_grad()
         self.optimizer.zero_grad()
+        torch.cuda.empty_cache()
         if self.mixed_precision:
             with torch.autocast(device_type="cuda", dtype=torch.float16):
                 # make predictions
@@ -542,6 +618,150 @@ class CellViTTrainer(BaseTrainer):
         return predictions
 
     def unpack_masks(self, masks: dict, tissue_types: list) -> DataclassHVStorage:
+        """Unpack GT masks and normalize shapes.
+        Accepts:
+        instance_map:      [H,W] or [B,H,W]
+        nuclei_binary_map: [H,W] or [B,H,W] or one-hot [H,W,2]/[B,H,W,2]
+        hv_map:            [2,H,W] or [B,2,H,W] or channels-last [H,W,2]/[B,H,W,2]
+        nuclei_type_map:   class-ids [H,W]/[B,H,W] or one-hot [H,W,C]/[B,H,W,C]
+        Produces channels-first tensors on self.device.
+        """
+        import torch
+        import torch.nn.functional as F
+
+        def to_tensor(x):
+            if isinstance(x, np.ndarray):
+                x = torch.from_numpy(x)
+            return x
+
+        # ---- instance_map -> [B,H,W] ----
+        inst = to_tensor(masks["instance_map"]).long()
+        if inst.dim() == 2:
+            inst = inst.unsqueeze(0)  # [1,H,W]
+        elif inst.dim() == 4 and inst.shape[1] == 1:
+            inst = inst.squeeze(1)    # [B,H,W]
+        # else assume [B,H,W]
+        # keep long dtype for instance ids
+
+        # ---- hv_map -> [B,2,H,W] ----
+        hv = to_tensor(masks["hv_map"]).float()
+        # possible shapes: [2,H,W], [B,2,H,W], [H,W,2], [B,H,W,2]
+        if hv.dim() == 3:
+            # [2,H,W] or [H,W,2]
+            if hv.shape[0] == 2:
+                hv = hv.unsqueeze(0)  # [1,2,H,W]
+            elif hv.shape[-1] == 2:
+                hv = hv.permute(2, 0, 1).unsqueeze(0)  # [1,2,H,W]
+            else:
+                raise ValueError(f"Unexpected hv_map shape {tuple(hv.shape)}")
+        elif hv.dim() == 4:
+            if hv.shape[1] == 2:
+                pass  # [B,2,H,W]
+            elif hv.shape[-1] == 2:
+                hv = hv.permute(0, 3, 1, 2)  # [B,2,H,W]
+            else:
+                raise ValueError(f"Unexpected hv_map shape {tuple(hv.shape)}")
+        else:
+            raise ValueError(f"Unexpected hv_map dims {hv.dim()}")
+
+        # ---- nuclei_binary_map -> [B,2,H,W] ----
+        nb = to_tensor(masks["nuclei_binary_map"]).long()
+        # could be class-ids [H,W]/[B,H,W] OR one-hot [H,W,2]/[B,H,W,2]
+        if nb.dim() == 2:
+            # [H,W] -> [1,H,W] -> one-hot [1,H,W,2] -> [1,2,H,W]
+            nb = F.one_hot(nb, num_classes=2).float().permute(2, 0, 1).unsqueeze(0)
+        elif nb.dim() == 3:
+            if nb.shape[0] in (1, 2) and nb.shape[0] != nb.shape[-1]:
+                # assume [B,H,W] ids
+                if nb.shape[0] != inst.shape[0]:  # if B=H or B=W false-positive, fix by aligning to inst
+                    nb = nb.unsqueeze(0) if nb.shape[0] != inst.shape[0] else nb
+                nb = F.one_hot(nb.long(), num_classes=2).float()  # [B,H,W,2]
+                nb = nb.permute(0, 3, 1, 2)  # [B,2,H,W]
+            elif nb.shape[-1] == 2:
+                # [H,W,2] one-hot, add batch
+                nb = nb.permute(2, 0, 1).unsqueeze(0).float()  # [1,2,H,W]
+            else:
+                # [B,H,W] ids typical
+                nb = F.one_hot(nb.long(), num_classes=2).float().permute(0, 3, 1, 2)
+        elif nb.dim() == 4:
+            if nb.shape[1] == 2:
+                nb = nb.float()                     # [B,2,H,W]
+            elif nb.shape[-1] == 2:
+                nb = nb.permute(0, 3, 1, 2).float() # [B,2,H,W]
+            else:
+                raise ValueError(f"Unexpected nuclei_binary_map shape {tuple(nb.shape)}")
+        else:
+            raise ValueError(f"Unexpected nuclei_binary_map dims {nb.dim()}")
+
+        # ---- nuclei_type_map -> [B,C,H,W] ----
+        ntm = to_tensor(masks["nuclei_type_map"])
+        if ntm.dim() == 2:
+            # [H,W] ids -> [1,H,W] -> one-hot [1,H,W,C] -> [1,C,H,W]
+            ntm = ntm.unsqueeze(0).long()
+            ntm = F.one_hot(ntm, num_classes=self.num_classes).float().permute(0, 3, 1, 2)
+        elif ntm.dim() == 3:
+            if ntm.shape[-1] == self.num_classes:
+                # [H,W,C] one-hot -> [1,C,H,W]
+                ntm = ntm.permute(2, 0, 1).unsqueeze(0).float()
+            elif ntm.shape[0] == self.num_classes and ntm.shape[1] == ntm.shape[2]:
+                # rare case already [C,H,W] -> add batch
+                ntm = ntm.unsqueeze(0).float()      # [1,C,H,W]
+            else:
+                # [B,H,W] ids or [H,W,B] accidental—assume [B,H,W] ids
+                if ntm.dtype != torch.long:
+                    ntm = ntm.long()
+                ntm = F.one_hot(ntm, num_classes=self.num_classes).float()  # [B,H,W,C]
+                ntm = ntm.permute(0, 3, 1, 2)  # [B,C,H,W]
+        elif ntm.dim() == 4:
+            if ntm.shape[1] == self.num_classes:
+                ntm = ntm.float()                    # [B,C,H,W]
+            elif ntm.shape[-1] == self.num_classes:
+                ntm = ntm.permute(0, 3, 1, 2).float()  # [B,C,H,W]
+            else:
+                # assume class-id maps [B,H,W,?]—unexpected
+                raise ValueError(f"Unexpected nuclei_type_map shape {tuple(ntm.shape)}")
+        else:
+            raise ValueError(f"Unexpected nuclei_type_map dims {ntm.dim()}")
+
+        # ---- instance_types_nuclei -> [B,C,H,W] ----
+        itn = (ntm * inst.unsqueeze(1))  # broadcast [B,1,H,W] over [B,C,H,W]
+
+        # ---- tissue_types -> [B] Long, case-insensitive mapping for strings ----
+        # Accept ints or strings (e.g., 'lung'/'Lung').
+        mapped_tissues = []
+        for t in tissue_types:
+            if isinstance(t, (int, np.integer)):
+                mapped_tissues.append(int(t))
+            else:
+                idx = self.tissue_types_lower[str(t).lower()]
+                mapped_tissues.append(idx)
+        tt = torch.tensor(mapped_tissues, dtype=torch.long)
+
+        # ---- move to device ----
+        inst = inst.to(self.device)
+        hv   = hv.to(self.device)
+        nb   = nb.to(self.device)
+        ntm  = ntm.to(self.device)
+        itn  = itn.to(self.device)
+        tt   = tt.to(self.device)
+
+        gt = {
+            "nuclei_type_map": ntm,         # [B,C,H,W]
+            "nuclei_binary_map": nb,        # [B,2,H,W]
+            "hv_map": hv,                   # [B,2,H,W]
+            "instance_map": inst,           # [B,H,W]
+            "instance_types_nuclei": itn,   # [B,C,H,W]
+            "tissue_types": tt,             # [B]
+        }
+        if "regression_map" in masks:
+            gt["regression_map"] = to_tensor(masks["regression_map"]).float().to(self.device)
+
+        gt = DataclassHVStorage(
+            **gt, batch_size=tt.shape[0], num_nuclei_classes=self.num_classes
+        )
+        return gt
+
+    def unpack_masks_prev(self, masks: dict, tissue_types: list) -> DataclassHVStorage:
         """Unpack the given masks. Main focus lays on reshaping and postprocessing masks to generate one dict
 
         Args:
@@ -859,8 +1079,10 @@ class CellViTTrainer(BaseTrainer):
         predictions = predictions.get_dict()
         gt = gt.get_dict()
 
-        assert num_images <= imgs.shape[0]
-        num_images = 4
+        num_images = int(min(num_images, int(imgs.shape[0])))
+        if num_images <= 0:
+            # nothing to plot; bail out gracefully
+            return None
 
         predictions["nuclei_binary_map"] = predictions["nuclei_binary_map"].permute(
             0, 2, 3, 1
