@@ -109,6 +109,8 @@ Running classifier head with Google Drive Training dataset
 
 python3 ./cellvit/train_cell_classifier_head.py --config /projectnb/ec500kb/projects/Fall_2025_Projects/Project_2/AI-guided-whole-slide-imaging-analysis/ProcessedData_npy/train_configs/fold_new_dataset.yaml
 
+python3 ./cellvit/train_cell_classifier_head.py --config /projectnb/ec500kb/projects/Fall_2025_Projects/Project_2/AI-guided-whole-slide-imaging-analysis/ProcessedDataset/v1_40x_area20/patches_cellvit_p512/train_configs/cellvit_train.yaml
+
 python3 ./cellvit/train_cell_classifier_head.py --config ./test_database/training_database/Example-Detection/train_configs/ViT256/fold_0.yaml
 
 
@@ -120,7 +122,32 @@ Potential bugs/debugging:
 Delete cache
 
 
+<<<<<<<<<<<<<<<<<<<<
 
+After training
 
+The weights etc. are saved under logs_local with the date 
 
+For inference:
 
+python3 ./cellvit/training/evaluate/inference_cellvit_experiment_detection.py --logdir ./logs_local/2025-11-03T222333_cellvit++ --dataset_path /projectnb/ec500kb/projects/Fall_2025_Projects/Project_2/AI-guided-whole-slide-imaging-analysis/ProcessedDataset/v1_40x_area20/patches_cellvit_p512 --cellvit_path ./checkpoints/HIPT-256/CellViT-256-x40-AMP.pth   --input_shape 512 512   --normalize_stains
+
+python3 ./cellvit/training/evaluate/inference_cellvit_experiment_detection.py --logdir ./logs_local/2025-11-03T224442_cellvit++ --dataset_path /projectnb/ec500kb/projects/Fall_2025_Projects/Project_2/AI-guided-whole-slide-imaging-analysis/ProcessedDataset/v1_40x_area20/patches_cellvit_p512 --cellvit_path ./checkpoints/HIPT-256/CellViT-256-x40-AMP.pth   --input_shape 512 512   --normalize_stains
+
+For segmentation:
+
+python3 /projectnb/ec500kb/projects/Fall_2025_Projects/Project_2/AI-guided-whole-slide-imaging-analysis/CellViT-plus-plus/cellvit/train_cellvit.py \
+  --config /projectnb/ec500kb/projects/Fall_2025_Projects/Project_2/AI-guided-whole-slide-imaging-analysis/ProcessedDataset/v1_40x_area20/patches_cellvit_p512_segmentation/train_configs/train_tcga_segmentation.yaml \
+  --experiment_class ExperimentCellVitSegmentation
+
+Not fully working but Pannuke (for tissue type too):
+python3 /projectnb/ec500kb/projects/Fall_2025_Projects/Project_2/AI-guided-whole-slide-imaging-analysis/CellViT-plus-plus/cellvit/train_cellvit.py   --config /projectnb/ec500kb/projects/Fall_2025_Projects/Project_2/AI-guided-whole-slide-imaging-analysis/ProcessedDataset/v1_40x_area20/patches_cellvit_p512_segmentation/train_configs/cellvit_segmentation.yaml
+
+Command for CellViT_256
+python3 /projectnb/ec500kb/projects/Fall_2025_Projects/Project_2/AI-guided-whole-slide-imaging-analysis/CellViT-plus-plus/cellvit/train_cellvit.py   --config /projectnb/ec500kb/projects/Fall_2025_Projects/Project_2/AI-guided-whole-slide-imaging-analysis/256_train/cellvit_segmentation.yaml
+
+##Permission Issues:
+
+Run:
+chmod g+w .
+chmod -R g+w *
