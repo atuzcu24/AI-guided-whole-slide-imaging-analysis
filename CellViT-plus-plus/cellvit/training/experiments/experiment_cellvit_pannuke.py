@@ -27,7 +27,7 @@ from cellvit.models.cell_segmentation.cellvit_sam import CellViTSAM
 from cellvit.models.cell_segmentation.cellvit_uni import CellViTUNI
 from cellvit.models.cell_segmentation.cellvit_virchow import CellViTVirchow
 from cellvit.models.cell_segmentation.cellvit_virchow2 import CellViTVirchow2
-#from cellvit.models.cell_segmentation.cellvit_sam_rosie_film import CellViTSAMRosieFiLM #Fusion
+from cellvit.models.cell_segmentation.cellvit_sam_rosie_film import CellViTSAMRosieFiLM #Fusion
 from cellvit.training.base_ml.base_early_stopping import EarlyStopping
 from cellvit.training.base_ml.base_experiment import BaseExperiment
 from cellvit.training.base_ml.base_loss import retrieve_loss_fn
@@ -636,25 +636,74 @@ class ExperimentCellVitPanNuke(BaseExperiment):
                 self.logger.info(model.load_state_dict(cellvit_pretrained, strict=True))
             model.freeze_encoder()
             self.logger.info(f"Loaded CellViT-SAM model with backbone: {backbone_type}")
+        
         if backbone_type.lower() == "sam-h-rosie-film":
-            # Instantiate the Rosie-FiLM fusion model
+
             model = CellViTSAMRosieFiLM(
                 model_path=pretrained_encoder,
                 num_nuclei_classes=self.run_conf["data"]["num_nuclei_classes"],
                 num_tissue_classes=self.run_conf["data"]["num_tissue_classes"],
-                vit_structure="SAM-H",
+                vit_structure="sam-h",   # FIXED
                 drop_rate=self.run_conf["training"].get("drop_rate", 0),
                 regression_loss=regression_loss,
                 rosie_hidden_dim=self.run_conf["model"].get("rosie_hidden_dim", 256),
             )
 
-            # Load the SAM encoder weights
             model.load_pretrained_encoder(model.model_path)
-
-            # (Optional) Freeze encoder – this matches the SAM baseline behavior
             model.freeze_encoder()
 
-            self.logger.info("Loaded CellViT-SAM + Rosie-FiLM fusion model (SAM-H backbone)")
+            self.logger.info("Loaded CellViT-SAM + Rosie-FiLM fusion model (sam-h backbone)")
+
+            # -----------------------------------------
+            # Debug: trainable parameters
+            # -----------------------------------------
+            self.logger.info("---- Trainable Parameters ----")
+            for name, p in model.named_parameters():
+                if p.requires_grad:
+                    self.logger.info(f"[TRAINABLE] {name}")
+
+            trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+            total_params = sum(p.numel() for p in model.parameters())
+            self.logger.info(f"Trainable params: {trainable_params:,} / {total_params:,}")
+
+            # FiLM internal weights
+            self.logger.info("FiLM MLP weights:")
+            for name, p in model.z4_film.named_parameters():
+                self.logger.info(f"FiLM {name}: {tuple(p.shape)}")
+
+            # Rosie head
+            self.logger.info("ROSIE classifier head:")
+            self.logger.info(str(model.rosie_model.classifier[2]))
+
+            # -----------------------------------------
+            # Optional: forward pass test
+            # -----------------------------------------
+            try:
+                dummy = torch.randn(1, 3, 128, 128).to(model.rosie_mean.device)
+                with torch.no_grad():
+                    out = model(dummy)
+                self.logger.info(f"Dummy forward OK: {out['nuclei_type_map'].shape}")
+            except Exception as e:
+                self.logger.error(f"Forward pass failed: {e}")
+
+            # FiLM stats
+            with torch.no_grad():
+                dummy_x = torch.randn(1, 3, 128, 128).to(model.rosie_mean.device)
+                x_rosie = model._rosie_preprocess(dummy_x)
+                rosie_vec = model.rosie_model(x_rosie)
+                film_vec = model.z4_film.mlp(rosie_vec)
+                self.logger.info(f"Rosie vec mean {rosie_vec.mean().item():.4f}, std {rosie_vec.std().item():.4f}")
+                self.logger.info(f"FiLM vec mean {film_vec.mean().item():.4f}, std {film_vec.std().item():.4f}")
+
+            # -----------------------------------------
+            # Finalize & return
+            # -----------------------------------------
+            model = model.to("cpu")
+            self.logger.info(f"\n{summary(model, input_size=(1, 3, 128, 128), device='cpu')}")
+
+            return model
+
+
 
         
         
