@@ -27,6 +27,7 @@ from cellvit.models.cell_segmentation.cellvit_sam import CellViTSAM
 from cellvit.models.cell_segmentation.cellvit_uni import CellViTUNI
 from cellvit.models.cell_segmentation.cellvit_virchow import CellViTVirchow
 from cellvit.models.cell_segmentation.cellvit_virchow2 import CellViTVirchow2
+#from cellvit.models.cell_segmentation.cellvit_sam_rosie_film import CellViTSAMRosieFiLM #Fusion
 from cellvit.training.base_ml.base_early_stopping import EarlyStopping
 from cellvit.training.base_ml.base_experiment import BaseExperiment
 from cellvit.training.base_ml.base_loss import retrieve_loss_fn
@@ -241,6 +242,20 @@ class ExperimentCellVitPanNuke(BaseExperiment):
             unfreeze_epoch=self.run_conf["training"]["unfreeze_epoch"],
             eval_every=self.run_conf["training"].get("eval_every", 1),
         )
+
+        # --- Always save latest checkpoint safely, even if eval_every is large ---
+        import os
+        ckpt_dir = os.path.join(self.run_conf["logging"]["log_dir"], "checkpoints")
+        os.makedirs(ckpt_dir, exist_ok=True)
+        ckpt_path = os.path.join(ckpt_dir, "latest_checkpoint.pth")
+
+        torch.save({
+            "epoch": self.run_conf["training"]["epochs"],
+            "model_state_dict": trainer.model.state_dict(),
+            "optimizer_state_dict": trainer.optimizer.state_dict(),
+            "scheduler_state_dict": trainer.scheduler.state_dict() if trainer.scheduler else None,
+        }, ckpt_path)
+        print(f"✅ Saved latest checkpoint → {ckpt_path}")
 
         # Select best model if not provided by early stopping
         checkpoint_dir = Path(self.run_conf["logging"]["log_dir"]) / "checkpoints"
@@ -552,6 +567,7 @@ class ExperimentCellVitPanNuke(BaseExperiment):
             "sam-b",
             "sam-l",
             "sam-h",
+            "sam-h-rosie-film",
             "uni",
             "virchow",
             "virchow2",
@@ -620,6 +636,28 @@ class ExperimentCellVitPanNuke(BaseExperiment):
                 self.logger.info(model.load_state_dict(cellvit_pretrained, strict=True))
             model.freeze_encoder()
             self.logger.info(f"Loaded CellViT-SAM model with backbone: {backbone_type}")
+        if backbone_type.lower() == "sam-h-rosie-film":
+            # Instantiate the Rosie-FiLM fusion model
+            model = CellViTSAMRosieFiLM(
+                model_path=pretrained_encoder,
+                num_nuclei_classes=self.run_conf["data"]["num_nuclei_classes"],
+                num_tissue_classes=self.run_conf["data"]["num_tissue_classes"],
+                vit_structure="SAM-H",
+                drop_rate=self.run_conf["training"].get("drop_rate", 0),
+                regression_loss=regression_loss,
+                rosie_hidden_dim=self.run_conf["model"].get("rosie_hidden_dim", 256),
+            )
+
+            # Load the SAM encoder weights
+            model.load_pretrained_encoder(model.model_path)
+
+            # (Optional) Freeze encoder – this matches the SAM baseline behavior
+            model.freeze_encoder()
+
+            self.logger.info("Loaded CellViT-SAM + Rosie-FiLM fusion model (SAM-H backbone)")
+
+        
+        
         if backbone_type.lower() == "uni":
             model = CellViTUNI(
                 model_uni_path=pretrained_encoder,
