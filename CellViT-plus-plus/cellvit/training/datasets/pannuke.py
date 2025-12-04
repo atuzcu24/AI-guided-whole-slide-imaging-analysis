@@ -350,7 +350,10 @@ class PanNukeDataset(CellDataset):
         y_map = np.zeros(orig_inst_map.shape[:2], dtype=np.float32)
 
         inst_list = list(np.unique(orig_inst_map))
-        inst_list.remove(0)  # 0 is background
+
+        if 0 in inst_list:
+            inst_list.remove(0)  # remove background safely
+
         for inst_id in inst_list:
             inst_map = np.array(orig_inst_map == inst_id, np.uint8)
             inst_box = get_bounding_box(inst_map)
