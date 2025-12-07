@@ -7,7 +7,9 @@ conda activate cellvit_env
 Connect to wandb
 
 Running:
-python3 ../../CellViT-plus-plus/cellvit/train_cellvit.py   --config /patches_cellvit_p128_pannuke/train_configs/cellvit_segmentation.yaml
+python3 ../../CellViT-plus-plus/cellvit/train_cellvit.py   --config ./patches_cellvit_p128_pannuke/train_configs/cellvit_segmentation.yaml
+Fusion:
+python3 ../../CellViT-plus-plus/cellvit/train_cellvit.py   --config ./patches_cellvit_p128_pannuke/train_configs/samh_rosie_film.yaml
 
 
 After first 58 epoch training it hit early stopping. I think it is due to learning rate getting too small, due to scheduler.
