@@ -28,6 +28,7 @@ from cellvit.models.cell_segmentation.cellvit_uni import CellViTUNI
 from cellvit.models.cell_segmentation.cellvit_virchow import CellViTVirchow
 from cellvit.models.cell_segmentation.cellvit_virchow2 import CellViTVirchow2
 from cellvit.models.cell_segmentation.cellvit_sam_rosie_film import CellViTSAMRosieFiLM #Fusion
+from cellvit.models.cell_segmentation.cellvit_virchow_rosie_film import CellViTVirchowRosieFiLM #Fusion
 from cellvit.training.base_ml.base_early_stopping import EarlyStopping
 from cellvit.training.base_ml.base_experiment import BaseExperiment
 from cellvit.training.base_ml.base_loss import retrieve_loss_fn
@@ -571,6 +572,7 @@ class ExperimentCellVitPanNuke(BaseExperiment):
             "uni",
             "virchow",
             "virchow2",
+            "virchow-rosie-film",
         ]
         if backbone_type.lower() not in implemented_backbones:
             raise NotImplementedError(
@@ -753,6 +755,23 @@ class ExperimentCellVitPanNuke(BaseExperiment):
             self.logger.info(
                 f"Loaded CellViTVirchow2 model with backbone: {backbone_type}"
             )
+        if backbone_type.lower() == "virchow-rosie-film":
+
+            model = CellViTVirchowRosieFiLM(
+                model_virchow_path=pretrained_encoder,
+                num_nuclei_classes=self.run_conf["data"]["num_nuclei_classes"],
+                num_tissue_classes=self.run_conf["data"]["num_tissue_classes"],
+                rosie_dim=self.run_conf["model"].get("rosie_dim", 50),
+                film_hidden_dim=self.run_conf["model"].get("film_hidden_dim", 256),
+            )
+
+            model.load_pretrained_encoder(pretrained_encoder)
+
+            if self.run_conf["model"].get("freeze_encoder", True):
+                model.freeze_encoder()
+
+            self.logger.info("Loaded CellViTVirchowRosieFiLM model (Virchow backbone + FiLM)")
+
         self.logger.info(f"\nModel: {model}")
         model = model.to("cpu")
         self.logger.info(
