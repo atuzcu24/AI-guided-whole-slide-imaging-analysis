@@ -174,6 +174,10 @@ class CellViTVirchow(CellViT):
             print(f"No checkpoint provided!")
         else:
             state_dict = torch.load(str(model_virchow_path), map_location="cpu")
+            # Only remove head if number of tissue classes is different from checkpoint
+            if getattr(self, "num_tissue_classes", None) != 19:
+                state_dict.pop("head.weight", None)
+                state_dict.pop("head.bias", None)
             msg = self.encoder.load_state_dict(state_dict, strict=False)
             print(f"Loading checkpoint: {msg}")
 
