@@ -161,6 +161,7 @@ class InferenceCellViT:
             "CellViTUNI",
             "CellViTVirchow",
             "CellViTVirchow2",
+            "CellViTSAMRosieFiLM", #Newly added
         ]
         if model_type not in implemented_models:
             raise NotImplementedError(
@@ -211,6 +212,20 @@ class InferenceCellViT:
                 num_nuclei_classes=self.run_conf["data"]["num_nuclei_classes"],
                 num_tissue_classes=self.run_conf["data"]["num_tissue_classes"],
             )
+        elif model_type == "CellViTSAMRosieFiLM":
+            from cellvit.models.cell_segmentation.cellvit_sam_rosie_film import CellViTSAMRosieFiLM
+
+            model = CellViTSAMRosieFiLM(
+                model_path=None,
+                num_nuclei_classes=self.run_conf["data"]["num_nuclei_classes"],
+                num_tissue_classes=self.run_conf["data"]["num_tissue_classes"],
+                vit_structure=self.run_conf["model"].get("backbone", "sam-h"),
+                regression_loss=self.run_conf["model"].get("regression_loss", False),
+                rosie_hidden_dim=self.run_conf["model"].get("rosie_hidden_dim", 256),
+                freeze_cellvit=self.run_conf["model"].get("freeze_cellvit", False),
+                freeze_rosie=self.run_conf["model"].get("freeze_rosie", False),
+            )
+
         return model
 
     def setup_patch_inference(
@@ -232,7 +247,7 @@ class InferenceCellViT:
         """
         # get model for inference
         checkpoint = torch.load(
-            self.run_dir / "checkpoints" / self.checkpoint_name, map_location="cpu"
+            self.run_dir / "checkpoints" / self.checkpoint_name, map_location="cpu", weights_only=False
         )
         model = self.get_model(model_type=checkpoint["arch"])
         self.logger.info(
