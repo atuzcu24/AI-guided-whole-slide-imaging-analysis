@@ -2,10 +2,6 @@
 
 This repository documents **inference**, **Docker/Singularity deployment**, and **training** workflows for the **CellViT + SAM-H + Rosie FiLM fusion model**.
 
-The commands and folders given are taken from SCC, so please adjust parts as needed.
-
-The docker implementation is for inference only currently.
-
 ---
 
 ## 1. Inference (Local Python Environment)
@@ -220,3 +216,68 @@ python3 ../../CellViT-plus-plus/cellvit/train_cellvit.py \
 
 * For full WSI inference via `detect_cells.py`, functionality is **experimental and still under development**.
 * For additional details, refer to the original **CellViT README.md**.
+
+## Docker Inference
+
+This section explains how to build and run the CellViT FiLM inference container using Docker. The Docker image is intended primarily for local testing and for conversion to Singularity on HPC systems.
+
+### Build the Docker Image
+
+From the root of the repository (where the Dockerfile and `requirements_inference.txt` are located):
+
+```bash
+docker buildx build \
+  --platform linux/amd64 \
+  -t cellvit-inference-amd64 \
+  --load \
+  .
+```
+
+Notes:
+
+* `--platform linux/amd64` is required when building on Apple Silicon (arm64) machines.
+* The image includes only inference-time dependencies.
+
+### Run with Local `run_dir`
+
+```bash
+docker run --rm --gpus all \
+  -v /path/to/images:/data/input \
+  -v /path/to/output:/data/output \
+  -v /path/to/run_dir:/data/run \
+  cellvit-inference-amd64
+```
+
+Expected container paths:
+
+* `/data/input`   : directory containing input image patches
+* `/data/output`  : directory where inference outputs will be written
+* `/data/run`     : CellViT run directory containing `checkpoints/model_best.pth`
+
+### Run Using a HuggingFace Checkpoint
+
+If you prefer to load the model directly from HuggingFace instead of a local `run_dir`:
+
+```bash
+docker run --rm --gpus all \
+  -e HF_REPO=BerkTuzcuBU/CellViT-FiLM-256-Run \
+  -v /path/to/images:/data/input \
+  -v /path/to/output:/data/output \
+  cellvit-inference-amd64
+```
+
+Notes:
+
+* When `HF_REPO` is set, the container ignores `/data/run`.
+* The repository must contain the checkpoint and config expected by `cellvit_rosie_film_inference.py`.
+
+### Export Docker Image for SCC / Singularity
+
+To run on BU SCC (or similar HPC systems), convert the Docker image to a Singularity image:
+
+```bash
+docker save cellvit-inference-amd64 > cellvit-inference.tar
+singularity build cellvit-inference.sif docker-archive://cellvit-inference.tar
+```
+
+After conversion, see the **Singularity Inference** section for execution instructions.
