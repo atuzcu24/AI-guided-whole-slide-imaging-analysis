@@ -6,6 +6,9 @@ This repository documents **inference**, **Docker/Singularity deployment**, and 
 
 ## 1. Inference (Local Python Environment)
 
+Input: Folder consisting of 256x256 RGB lung tissue H&E images (preferably png).
+Output: The predictions, including type maps, binary maps and cell classifications overlays with legends.
+
 ### 1.1 Create and Activate Environment
 
 ```bash
