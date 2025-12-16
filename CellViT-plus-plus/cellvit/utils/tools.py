@@ -10,12 +10,22 @@ import logging
 import sys
 from pathlib import Path
 from typing import List, Union
+from typing import TYPE_CHECKING
 
-import cupy as cp
+#import cupy as cp
 import numpy as np
 import pandas as pd
 
-from cupyx.scipy import ndimage as ndimage_cp
+try:
+    import cupy as cp
+    from cupyx.scipy import ndimage as ndimage_cp
+    _CUPY_AVAILABLE = True
+except ImportError:
+    cp = None
+    ndimage_cp = None
+    _CUPY_AVAILABLE = False
+
+#from cupyx.scipy import ndimage as ndimage_cp
 from scipy import ndimage
 
 
@@ -32,7 +42,7 @@ def get_bounding_box(img):
     return [rmin, rmax, cmin, cmax]
 
 
-def remove_small_objects_cp(pred: cp.ndarray, min_size=64, connectivity=1):
+def remove_small_objects_cp(pred: "cupy.ndarray", min_size=64, connectivity=1):
     """Remove connected components smaller than the specified size.
 
     This function is taken from skimage.morphology.remove_small_objects, but the warning
@@ -47,6 +57,8 @@ def remove_small_objects_cp(pred: cp.ndarray, min_size=64, connectivity=1):
         out: output array with instances removed under min_size
 
     """
+    if not _CUPY_AVAILABLE:
+        raise RuntimeError("CuPy is not available")
     out = pred
 
     if min_size == 0:  # shortcut for efficiency
