@@ -21,6 +21,15 @@ from numba import njit
 from PIL import Image
 from scipy.ndimage import center_of_mass, distance_transform_edt
 
+try:
+    from scipy.ndimage import sobel as _scipy_sobel
+except ImportError:
+    _scipy_sobel = None
+try:
+    from scipy.ndimage import convolve as _scipy_convolve
+except ImportError:
+    _scipy_convolve = None
+
 from cellvit.training.datasets.base_cell_dataset import CellDataset
 from cellvit.training.utils.tools import fix_duplicates, get_bounding_box
 
@@ -54,6 +63,7 @@ class PanNukeDataset(CellDataset):
         stardist: bool = False,
         regression: bool = False,
         cache_dataset: bool = False,
+        proxy_channels: dict | None = None,
     ) -> None:
         if isinstance(folds, int):
             folds = [folds]
@@ -68,6 +78,13 @@ class PanNukeDataset(CellDataset):
         self.cache_dataset = cache_dataset
         self.stardist = stardist
         self.regression = regression
+        self.proxy_channels = proxy_channels or {}
+        self.proxy_type = self.proxy_channels.get("type", "sobel_mag")
+        self.proxy_enabled = (
+            self.proxy_channels.get("enabled", False)
+            and self.proxy_type in ("sobel_mag", "stain_deconv_h")
+        )
+        self.proxy_normalize = self.proxy_channels.get("normalize", True)
         for fold in folds:
             image_path = self.dataset / f"fold{fold}" / "images"
             fold_images = [
@@ -88,8 +105,10 @@ class PanNukeDataset(CellDataset):
                     logger.debug(
                         "Found image {fold_image}, but no corresponding annotation file!"
                     )
+
             fold_types = pd.read_csv(self.dataset / f"fold{fold}" / "types.csv")
             fold_type_dict = fold_types.set_index("img")["type"].to_dict()
+            
             self.types = {
                 **self.types,
                 **fold_type_dict,
@@ -104,6 +123,96 @@ class PanNukeDataset(CellDataset):
             self.cached_masks = {}  # keys: idx, values: numpy array of masks
             logger.info("Using cached dataset. Cache is built up during first epoch.")
         self.totensor_transform = ToTensorV2()
+
+    @staticmethod
+    def _sobel_numpy(gray: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Sobel gradients (fallback when scipy.ndimage.sobel unavailable)."""
+        kx = np.array([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=np.float64)
+        ky = np.array([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=np.float64)
+        if _scipy_convolve is not None:
+            gx = _scipy_convolve(gray, kx, mode="nearest")
+            gy = _scipy_convolve(gray, ky, mode="nearest")
+        else:
+            gx = np.zeros_like(gray, dtype=np.float64)
+            gy = np.zeros_like(gray, dtype=np.float64)
+            h, w = gray.shape
+            padded = np.pad(gray.astype(np.float64), 1, mode="edge")
+            for i in range(h):
+                for j in range(w):
+                    patch = padded[i : i + 3, j : j + 3]
+                    gx[i, j] = np.sum(patch * kx)
+                    gy[i, j] = np.sum(patch * ky)
+        return gx.astype(np.float32), gy.astype(np.float32)
+
+    @staticmethod
+    def _stain_deconv_hematoxylin(img: np.ndarray, normalize: bool = True) -> np.ndarray:
+        """Extract Hematoxylin channel via Ruifrok & Johnston color deconvolution.
+        img: (H,W,3) RGB uint8 or float. Returns (H,W) float H channel."""
+        if img.dtype == np.uint8:
+            rgb = img.astype(np.float64) / 255.0
+        else:
+            rgb = np.asarray(img, dtype=np.float64)
+        eps = 1e-8
+        od = -np.log10(np.clip(rgb + eps, eps, 1.0))
+        # Ruifrok H&E stain matrix (columns: H, E; rows: R,G,B in OD space)
+        W_he = np.array([
+            [0.650, 0.072],
+            [0.704, 0.990],
+            [0.286, 0.105],
+        ], dtype=np.float64)
+        # Complement third column for full rank (cross product)
+        v1, v2 = W_he[:, 0], W_he[:, 1]
+        v3 = np.cross(v1, v2)
+        v3 = v3 / (np.linalg.norm(v3) + eps)
+        W = np.column_stack([v1, v2, v3])
+        Q = np.linalg.pinv(W)
+        h, w, _ = od.shape
+        od_flat = od.reshape(-1, 3).T
+        conc_flat = (Q @ od_flat).T
+        hema = conc_flat[:, 0].reshape(h, w).astype(np.float32)
+        if normalize:
+            m_min, m_max = hema.min(), hema.max()
+            if m_max > m_min:
+                hema = (hema - m_min) / (m_max - m_min)
+            else:
+                hema = np.zeros_like(hema)
+        hema = np.clip(hema, 0.0, 1.0)
+        return hema
+
+    def _add_proxy_channel(self, img: np.ndarray) -> np.ndarray:
+        """Add proxy channel (Sobel mag or Hematoxylin). img: (H,W,3) -> (H,W,4)."""
+        if self.proxy_type == "stain_deconv_h":
+            proxy = self._stain_deconv_hematoxylin(img, self.proxy_normalize)
+        else:
+            proxy = self._add_sobel_proxy_channel(img)
+        proxy = proxy[:, :, np.newaxis]
+        if img.dtype == np.uint8:
+            base = img
+            proxy_uint = (np.clip(proxy, 0, 1) * 255).astype(np.uint8)
+            return np.concatenate([base, proxy_uint], axis=-1)
+        base = np.asarray(img, dtype=np.float32)
+        return np.concatenate([base, proxy.astype(np.float32)], axis=-1)
+
+    def _add_sobel_proxy_channel(self, img: np.ndarray) -> np.ndarray:
+        """Add Sobel magnitude proxy. img: (H,W,3) -> (H,W) float."""
+        if img.dtype == np.uint8:
+            img_f = img.astype(np.float32) / 255.0
+        else:
+            img_f = np.asarray(img, dtype=np.float32)
+        gray = 0.299 * img_f[:, :, 0] + 0.587 * img_f[:, :, 1] + 0.114 * img_f[:, :, 2]
+        if _scipy_sobel is not None:
+            gx = _scipy_sobel(gray, axis=1)
+            gy = _scipy_sobel(gray, axis=0)
+        else:
+            gx, gy = self._sobel_numpy(gray)
+        mag = np.sqrt(gx ** 2 + gy ** 2).astype(np.float32)
+        if self.proxy_normalize:
+            m_min, m_max = mag.min(), mag.max()
+            if m_max > m_min:
+                mag = (mag - m_min) / (m_max - m_min)
+            else:
+                mag = np.zeros_like(mag)
+        return np.clip(mag, 0.0, 1.0)
 
     def __getitem__(self, index: int) -> Tuple[torch.Tensor, dict, str, str]:
         """Get one dataset item consisting of transformed image,
@@ -160,12 +269,18 @@ class PanNukeDataset(CellDataset):
         np_map[np_map > 0] = 1
         hv_map = PanNukeDataset.gen_instance_hv_map(inst_map)
 
+        # Proxy channel: Sobel magnitude or Hematoxylin (stain_deconv_h)
+        if self.proxy_enabled:
+            img = self._add_proxy_channel(img)
+
         # torch convert
-        # img = torch.Tensor(img).type(torch.float32)
-        # img = img.permute(2, 0, 1)
-        # if torch.max(img) >= 5:
-        #     img = img / 255
         img = self.totensor_transform(image=img)["image"]
+
+        if self.proxy_enabled:
+            assert img.shape[0] == 4, (
+                f"[PanNuke proxy] Expected 4 channels (RGB+proxy), got {img.shape[0]}. "
+                "Check proxy_channels.enabled and transforms."
+            )
 
         masks = {
             "instance_map": torch.Tensor(inst_map).type(torch.int64),
@@ -252,12 +367,14 @@ class PanNukeDataset(CellDataset):
     def get_sampling_weights_tissue(self, gamma: float = 1) -> torch.Tensor:
         """Get sampling weights calculated by tissue type statistics
 
-        For this, a file named "weight_config.yaml" with the content:
+        Uses weight_config.yaml in the dataset root if present; otherwise derives
+        tissue counts from self.types (from types.csv in folds).
+
+        weight_config.yaml format:
             tissue:
                 tissue_1: xxx
                 tissue_2: xxx (name of tissue: count)
                 ...
-        Must exists in the dataset main folder (parent path, not inside the folds)
 
         Args:
             gamma (float, optional): Gamma scaling factor, between 0 and 1.
@@ -267,11 +384,14 @@ class PanNukeDataset(CellDataset):
             torch.Tensor: Weights for each sample
         """
         assert 0 <= gamma <= 1, "Gamma must be between 0 and 1"
-        with open(
-            (self.dataset / "weight_config.yaml").resolve(), "r"
-        ) as run_config_file:
-            yaml_config = yaml.safe_load(run_config_file)
-            tissue_counts = dict(yaml_config)["tissue"]
+        weight_config_path = (self.dataset / "weight_config.yaml").resolve()
+        if weight_config_path.is_file():
+            with open(weight_config_path, "r") as run_config_file:
+                yaml_config = yaml.safe_load(run_config_file)
+                tissue_counts = dict(yaml_config)["tissue"]
+        else:
+            from collections import Counter
+            tissue_counts = dict(Counter(self.types.values()))
 
         # calculate weight for each tissue
         weights_dict = {}
