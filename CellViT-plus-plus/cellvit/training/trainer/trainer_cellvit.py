@@ -140,6 +140,7 @@ class CellViTTrainer(BaseTrainer):
         self.tissue_types_lower = {k.lower(): v for k, v in self.tissue_types.items()}
         self.nuclei_types = dataset_config["nuclei_types"]
         self.magnification = magnification
+        self.log_val_previews=None
 
         # setup logging objects
         self.loss_avg_tracker = {"Total_Loss": AverageMeter("Total_Loss", ":.4f")}
@@ -148,6 +149,8 @@ class CellViTTrainer(BaseTrainer):
                 self.loss_avg_tracker[f"{branch}_{loss_name}"] = AverageMeter(
                     f"{branch}_{loss_name}", ":.4f"
                 )
+        self.loss_avg_tracker["np_prior_sup"] = AverageMeter("np_prior_sup", ":.4f")
+        self.loss_avg_tracker["np_prior_bd"] = AverageMeter("np_prior_bd", ":.4f")
         self.batch_avg_tissue_acc = AverageMeter("Batch_avg_tissue_ACC", ":4.f")
 
     def train_epoch(
@@ -173,12 +176,23 @@ class CellViTTrainer(BaseTrainer):
         tissue_pred = []
         tissue_gt = []
         train_example_img = None
+        gate_mean_acc = 0.0
+        gate_sparse_acc = 0.0
+        gate_min_acc = float("inf")
+        gate_max_acc = float("-inf")
+        gate_batch_count = 0
 
         # reset metrics
         self.loss_avg_tracker["Total_Loss"].reset()
+        # reset conditioning dropout mode counts per epoch
+        if hasattr(self.model, "_cond_mode_counts") and self.model._cond_mode_counts:
+            for k in self.model._cond_mode_counts:
+                self.model._cond_mode_counts[k] = 0
         for branch, loss_fns in self.loss_fn_dict.items():
             for loss_name in loss_fns:
                 self.loss_avg_tracker[f"{branch}_{loss_name}"].reset()
+        self.loss_avg_tracker["np_prior_sup"].reset()
+        self.loss_avg_tracker["np_prior_bd"].reset()
         self.batch_avg_tissue_acc.reset()
 
         # randomly select a batch that should be displayed
@@ -188,7 +202,34 @@ class CellViTTrainer(BaseTrainer):
             select_example_image = None
         train_loop = tqdm.tqdm(enumerate(train_dataloader), total=len(train_dataloader))
 
+        _pc = self.experiment_config.get("data", {}).get("proxy_channels", {})
+        proxy_enabled = (
+            _pc.get("enabled", False)
+            and _pc.get("type") in ("sobel_mag", "stain_deconv_h")
+        )
+        fusion_cfg = self.experiment_config.get("fusion", {})
+        markergate_expected = (
+            fusion_cfg.get("gate_l1_weight", 0.0) > 0
+            or (
+                fusion_cfg.get("film_use_gating", False)
+                and fusion_cfg.get("film_gating_mode", "") == "per_marker"
+            )
+        )
+        proxy_mean_acc = 0.0
+        proxy_std_acc = 0.0
+        proxy_channel_count = 0
+
         for batch_idx, batch in train_loop:
+            if batch_idx == 0:
+                imgs = batch[0]
+                self.logger.info(f"[Train epoch {epoch+1}] input shape: {tuple(imgs.shape)}")
+            if proxy_enabled:
+                imgs_b = batch[0]
+                if imgs_b.shape[1] >= 4:
+                    pc = imgs_b[:, 3, :, :].float()
+                    proxy_mean_acc += pc.mean().item()
+                    proxy_std_acc += pc.std().item()
+                    proxy_channel_count += 1
             return_example_images = batch_idx == select_example_image
             batch_metrics, example_img = self.train_step(
                 batch,
@@ -206,6 +247,36 @@ class CellViTTrainer(BaseTrainer):
             )
             tissue_pred.append(batch_metrics["tissue_pred"])
             tissue_gt.append(batch_metrics["tissue_gt"])
+            if hasattr(self.model, "_last_marker_gate") and self.model._last_marker_gate is not None:
+                g = self.model._last_marker_gate.detach()
+                gate_mean_acc += g.mean().item()
+                gate_sparse_acc += (g < 0.1).float().mean().item()
+                gate_min_acc = min(gate_min_acc, g.min().item())
+                gate_max_acc = max(gate_max_acc, g.max().item())
+                gate_batch_count += 1
+            if markergate_expected and batch_idx == 0:
+                assert hasattr(self.model, "_last_marker_gate_w") and self.model._last_marker_gate_w is not None, (
+                    "[Markergate] Expected _last_marker_gate_w when fusion.gate_l1_weight>0 or "
+                    "film_use_gating+per_marker. Check model config."
+                )
+            # Optional FiLM gamma/beta stats logging (Virchow Rosie FiLM)
+            log_film_every = fusion_cfg.get("log_film_stats_every", 0)
+            if log_film_every > 0 and hasattr(self.model, "get_film_stats_and_reset"):
+                global_step = epoch * len(train_dataloader) + batch_idx
+                if (global_step + 1) % log_film_every == 0:
+                    stats = self.model.get_film_stats_and_reset()
+                    if stats:
+                        for layer, s in stats.items():
+                            self.logger.info(
+                                f"[FiLM {layer}] gamma_mean={s['gamma_mean']:.4f} gamma_std={s['gamma_std']:.4f} "
+                                f"beta_mean={s['beta_mean']:.4f} beta_std={s['beta_std']:.4f}"
+                            )
+                        try:
+                            import wandb
+                            flat = {f"film_{layer}_{k}": v for layer, s in stats.items() for k, v in s.items()}
+                            wandb.log(flat, step=global_step)
+                        except Exception:
+                            pass
             train_loop.set_postfix(
                 {
                     "Loss": np.round(self.loss_avg_tracker["Total_Loss"].avg, 3),
@@ -233,6 +304,38 @@ class CellViTTrainer(BaseTrainer):
                 scalar_metrics[f"{branch}_{loss_name}/Train"] = self.loss_avg_tracker[
                     f"{branch}_{loss_name}"
                 ].avg
+        scalar_metrics["np_prior_sup/Train"] = self.loss_avg_tracker["np_prior_sup"].avg
+        scalar_metrics["np_prior_bd/Train"] = self.loss_avg_tracker["np_prior_bd"].avg
+
+        # Log rosie_features mean/std when conditioning_mode_train override is active
+        if hasattr(self.model, "_last_rosie_feat_mean") and self.model._last_rosie_feat_mean is not None:
+            scalar_metrics["Rosie/rosie_feat_mean/Train"] = self.model._last_rosie_feat_mean
+        if hasattr(self.model, "_last_rosie_feat_std") and self.model._last_rosie_feat_std is not None:
+            scalar_metrics["Rosie/rosie_feat_std/Train"] = self.model._last_rosie_feat_std
+
+        # Log proxy channel stats (when proxy enabled)
+        if proxy_channel_count > 0:
+            scalar_metrics["Proxy/proxy_channel_mean/Train"] = proxy_mean_acc / proxy_channel_count
+            scalar_metrics["Proxy/proxy_channel_std/Train"] = proxy_std_acc / proxy_channel_count
+
+        # Log marker gate stats (per-marker gating)
+        if gate_batch_count > 0:
+            scalar_metrics["Rosie/marker_gate_mean/Train"] = gate_mean_acc / gate_batch_count
+            scalar_metrics["Rosie/marker_gate_frac_sparse/Train"] = gate_sparse_acc / gate_batch_count
+            scalar_metrics["Rosie/marker_gate_min/Train"] = gate_min_acc
+            scalar_metrics["Rosie/marker_gate_max/Train"] = gate_max_acc
+            if hasattr(self.model, "_last_rosie_feat_std_before_gate") and self.model._last_rosie_feat_std_before_gate is not None:
+                scalar_metrics["Rosie/rosie_feat_std_before_gate/Train"] = self.model._last_rosie_feat_std_before_gate
+            if hasattr(self.model, "_last_rosie_feat_std_after_gate") and self.model._last_rosie_feat_std_after_gate is not None:
+                scalar_metrics["Rosie/rosie_feat_std_after_gate/Train"] = self.model._last_rosie_feat_std_after_gate
+
+        # Log conditioning dropout mode counts per epoch
+        if hasattr(self.model, "_cond_mode_counts") and self.model._cond_mode_counts:
+            for mode_name, count in self.model._cond_mode_counts.items():
+                scalar_metrics[f"Rosie/cond_mode_{mode_name}_count/Train"] = float(count)
+            self.logger.info(
+                f"  [conditioning_dropout] mode counts: {dict(self.model._cond_mode_counts)}"
+            )
 
         self.logger.info(
             f"{'Training epoch stats:' : <25} "
@@ -241,6 +344,10 @@ class CellViTTrainer(BaseTrainer):
             f"Binary-Cell-Jacard: {np.nanmean(binary_jaccard_scores):.4f} - "
             f"Tissue-MC-Acc.: {tissue_detection_accuracy:.4f}"
         )
+        if hasattr(self.model, "_last_rosie_feat_mean") and self.model._last_rosie_feat_mean is not None:
+            self.logger.info(
+                f"  [conditioning override] rosie_feat mean={self.model._last_rosie_feat_mean:.6f} std={self.model._last_rosie_feat_std:.6f}"
+            )
 
         image_metrics = {"Example-Predictions/Train": train_example_img}
 
@@ -358,6 +465,8 @@ class CellViTTrainer(BaseTrainer):
         for branch, loss_fns in self.loss_fn_dict.items():
             for loss_name in loss_fns:
                 self.loss_avg_tracker[f"{branch}_{loss_name}"].reset()
+        self.loss_avg_tracker["np_prior_sup"].reset()
+        self.loss_avg_tracker["np_prior_bd"].reset()
         self.batch_avg_tissue_acc.reset()
 
         # randomly select a batch that should be displayed
@@ -402,7 +511,7 @@ class CellViTTrainer(BaseTrainer):
                 )
         # --- Save K validation previews from the chosen batch (once per epoch) ---
         try:
-            if self.log_images and chosen_batch is not None:
+            if self.log_val_previews is not None:
                 imgs = chosen_batch[0].to(self.device)
                 masks = chosen_batch[1]
                 tissue_types = chosen_batch[2]
@@ -460,6 +569,8 @@ class CellViTTrainer(BaseTrainer):
                 scalar_metrics[
                     f"{branch}_{loss_name}/Validation"
                 ] = self.loss_avg_tracker[f"{branch}_{loss_name}"].avg
+        scalar_metrics["np_prior_sup/Validation"] = self.loss_avg_tracker["np_prior_sup"].avg
+        scalar_metrics["np_prior_bd/Validation"] = self.loss_avg_tracker["np_prior_bd"].avg
 
         # calculate local metrics
         # per tissue class
@@ -866,8 +977,50 @@ class CellViTTrainer(BaseTrainer):
                 self.loss_avg_tracker[f"{branch}_{loss_name}"].update(
                     loss_value.detach().cpu().numpy()
                 )
-        self.loss_avg_tracker["Total_Loss"].update(total_loss.detach().cpu().numpy())
 
+        # Gate L1 regularization (RosieFiLM per-marker gate only)
+        fusion_cfg = self.experiment_config.get("fusion", {})
+        gate_l1_weight = fusion_cfg.get("gate_l1_weight", 0.0)
+        if (
+            gate_l1_weight > 0
+            and hasattr(self.model, "_last_marker_gate")
+            and self.model._last_marker_gate is not None
+        ):
+            gate_l1 = gate_l1_weight * self.model._last_marker_gate.abs().mean()
+            total_loss = total_loss + gate_l1
+
+        # NP prior regularizers (L_sup, L_bd) - protein-informed geometric prior
+        sup_w = fusion_cfg.get("np_prior_sup_weight", 0.0)
+        bd_w = fusion_cfg.get("np_prior_bd_weight", 0.0)
+        np_prior_detach = fusion_cfg.get("np_prior_detach", False)  # False: prior head learns from L_sup/L_bd
+        s = None
+        if (sup_w > 0 or bd_w > 0) and hasattr(self.model, "_last_np_prior_s"):
+            s = self.model._last_np_prior_s
+        if s is not None and isinstance(s, torch.Tensor):
+            y_fg = predictions["nuclei_binary_map"][:, 1:2, :, :]  # [B,1,H,W]
+            H, W = y_fg.shape[2], y_fg.shape[3]
+            s = s.detach() if np_prior_detach else s
+            if s.shape[2] != H or s.shape[3] != W:
+                s = F.interpolate(s, size=(H, W), mode="bilinear", align_corners=False)
+            s = s.clamp(1e-6, 1.0 - 1e-6)
+            if sup_w > 0:
+                L_sup = (y_fg * (1.0 - s)).mean()
+                total_loss = total_loss + sup_w * L_sup
+                self.loss_avg_tracker["np_prior_sup"].update(L_sup.detach().cpu().numpy())
+            if bd_w > 0:
+                dx_y = y_fg[:, :, :, 1:] - y_fg[:, :, :, :-1]
+                dy_y = y_fg[:, :, 1:, :] - y_fg[:, :, :-1, :]
+                dx_y = F.pad(dx_y, (0, 1, 0, 0))
+                dy_y = F.pad(dy_y, (0, 0, 0, 1))
+                dx_s = s[:, :, :, 1:] - s[:, :, :, :-1]
+                dy_s = s[:, :, 1:, :] - s[:, :, :-1, :]
+                dx_s = F.pad(dx_s, (0, 1, 0, 0))
+                dy_s = F.pad(dy_s, (0, 0, 0, 1))
+                L_bd = (dx_y - dx_s).abs().mean() + (dy_y - dy_s).abs().mean()
+                total_loss = total_loss + bd_w * L_bd
+                self.loss_avg_tracker["np_prior_bd"].update(L_bd.detach().cpu().numpy())
+
+        self.loss_avg_tracker["Total_Loss"].update(total_loss.detach().cpu().numpy())
         return total_loss
 
     def calculate_step_metric_train(
@@ -1105,10 +1258,12 @@ class CellViTTrainer(BaseTrainer):
         w = gt["hv_map"].shape[2]
 
         sample_indices = torch.randint(0, imgs.shape[0], (num_images,))
-        # convert to rgb and crop to selection
+        # convert to rgb and crop to selection (proxy channels ignored for viz)
         sample_images = (
             imgs[sample_indices].permute(0, 2, 3, 1).contiguous().cpu().numpy()
-        )  # convert to rgb
+        )
+        if sample_images.shape[-1] > 3:
+            sample_images = sample_images[..., :3]
         sample_images = cropping_center(sample_images, (h, w), True)
 
         # get predictions
