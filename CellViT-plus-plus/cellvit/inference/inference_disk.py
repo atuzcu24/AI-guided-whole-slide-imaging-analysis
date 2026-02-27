@@ -46,6 +46,9 @@ from cellvit.models.cell_segmentation.cellvit import CellViT
 from cellvit.models.cell_segmentation.cellvit_256 import CellViT256
 from cellvit.models.cell_segmentation.cellvit_sam import CellViTSAM
 from cellvit.models.cell_segmentation.cellvit_uni import CellViTUNI
+from cellvit.models.cell_segmentation.cellvit_sam_rosie_film import CellViTSAMRosieFiLM
+from cellvit.models.cell_segmentation.cellvit_sam_rosie_early_fusion import CellViTSAMRosieEarlyFusion, expand_input_layer
+from cellvit.models.cell_segmentation.cellvit_virchow_rosie_film import CellViTVirchowRosieFiLM
 from cellvit.utils.logger import Logger
 from cellvit.utils.tools import unflatten_dict
 from cellvit.models.classifier.linear_classifier import LinearClassifier
@@ -203,11 +206,15 @@ class CellViTInference:
         """Load model and checkpoint and load the state_dict"""
         self.logger.info(f"Loading model: {self.model_path}")
 
-        model_checkpoint = torch.load(self.model_path, map_location="cpu")
+        model_checkpoint = torch.load(self.model_path, map_location="cpu", weights_only=False)
 
         # unpack checkpoint
         self.run_conf = unflatten_dict(model_checkpoint["config"], ".")
         self.model = self._get_model(model_type=model_checkpoint["arch"])
+        if model_checkpoint["arch"] == "CellViTSAMRosieEarlyFusion":
+            if not getattr(self.model, "_encoder_expanded", False):
+                expand_input_layer(self.model.encoder, self.model.input_channels, "zeros")
+                self.model._encoder_expanded = True
         self.logger.info(
             self.model.load_state_dict(model_checkpoint["model_state_dict"])
         )
@@ -225,28 +232,28 @@ class CellViTInference:
         max_batch_size = 128
         gpu_memory_gb = torch.cuda.get_device_properties(gpu).total_memory / 1e9
         if gpu_memory_gb < 22:
-            if self.model_arch == "CellViTSAM":
+            if self.model_arch in ("CellViTSAM", "CellViTVirchowRosieFiLM", "CellViTSAMRosieFiLM"):
                 max_batch_size = 2
             elif self.model_arch == "CellViTUNI":
                 max_batch_size = 8
             elif self.model_arch == "CellViT256":
                 max_batch_size = 8
         elif gpu_memory_gb < 38:
-            if self.model_arch == "CellViTSAM":
+            if self.model_arch in ("CellViTSAM", "CellViTVirchowRosieFiLM", "CellViTSAMRosieFiLM"):
                 max_batch_size = 4
             elif self.model_arch == "CellViTUNI":
                 max_batch_size = 8
             elif self.model_arch == "CellViT256":
                 max_batch_size = 8
         elif gpu_memory_gb < 78:
-            if self.model_arch == "CellViTSAM":
+            if self.model_arch in ("CellViTSAM", "CellViTVirchowRosieFiLM", "CellViTSAMRosieFiLM"):
                 max_batch_size = 8
             elif self.model_arch == "CellViTUNI":
                 max_batch_size = 16
             elif self.model_arch == "CellViT256":
                 max_batch_size = 24
         else:
-            if self.model_arch == "CellViTSAM":
+            if self.model_arch in ("CellViTSAM", "CellViTVirchowRosieFiLM", "CellViTSAMRosieFiLM"):
                 max_batch_size = 16
             elif self.model_arch == "CellViTUNI":
                 max_batch_size = 32
@@ -269,7 +276,7 @@ class CellViTInference:
         if classifier_path is None:
             self.classifier = None
         else:
-            model_checkpoint = torch.load(classifier_path, map_location="cpu")
+            model_checkpoint = torch.load(classifier_path, map_location="cpu", weights_only=False)
             run_conf = unflatten_dict(model_checkpoint["config"], ".")
 
             model = LinearClassifier(
@@ -300,7 +307,7 @@ class CellViTInference:
         Returns:
             Union[CellViT, CellViT256, CellViTSAM, CellViTUNI]: Model
         """
-        implemented_models = ["CellViT", "CellViT256", "CellViTSAM", "CellViTUNI"]
+        implemented_models = ["CellViT", "CellViT256", "CellViTSAM", "CellViTUNI", "CellViTSAMRosieFiLM", "CellViTSAMRosieEarlyFusion", "CellViTVirchowRosieFiLM"]
         if model_type not in implemented_models:
             raise NotImplementedError(
                 f"Unknown model type. Please select one of {implemented_models}"
@@ -337,6 +344,81 @@ class CellViTInference:
                 model_uni_path=None,
                 num_nuclei_classes=self.run_conf["data"]["num_nuclei_classes"],
                 num_tissue_classes=self.run_conf["data"]["num_tissue_classes"],
+            )
+
+        elif model_type == "CellViTSAMRosieFiLM":
+            fusion_cfg = self.run_conf.get("fusion", {})
+            model_cfg = self.run_conf.get("model", {})
+            film_layers = fusion_cfg.get("film_layers", ["z4"])
+            film_feat_dims = fusion_cfg.get("film_feat_dims", {})
+            if not film_feat_dims and film_layers:
+                bb = str(model_cfg.get("backbone", "sam-h")).upper()
+                embed = {"SAM-B": 768, "SAM-L": 1024, "SAM-H": 1280}.get(bb, 1280)
+                film_feat_dims = {k: (256 if k == "z4" else embed) for k in film_layers}
+            model = CellViTSAMRosieFiLM(
+                model_path=None,
+                num_nuclei_classes=self.run_conf["data"]["num_nuclei_classes"],
+                num_tissue_classes=self.run_conf["data"]["num_tissue_classes"],
+                vit_structure=model_cfg.get("backbone", "sam-h"),
+                regression_loss=model_cfg.get("regression_loss", False),
+                rosie_hidden_dim=model_cfg.get("rosie_hidden_dim", 256),
+                freeze_cellvit=fusion_cfg.get("freeze_cellvit", False),
+                freeze_rosie=fusion_cfg.get("freeze_rosie", False),
+                film_enabled=fusion_cfg.get("film_enabled", True),
+                film_layers=tuple(film_layers),
+                film_feat_dims=film_feat_dims,
+                film_init=fusion_cfg.get("film_init", "default"),
+                film_use_gating=fusion_cfg.get("film_use_gating", False),
+                film_gating_init=fusion_cfg.get("film_gating_init", 0.0),
+                film_gating_mode=fusion_cfg.get("film_gating_mode", "scalar"),
+                film_scale=fusion_cfg.get("film_scale", 1.0),
+                film_clamp_gamma=fusion_cfg.get("film_clamp_gamma"),
+                unfreeze_last_n_blocks=fusion_cfg.get("unfreeze_last_n_blocks"),
+                unfreeze_full_encoder=fusion_cfg.get("unfreeze_full_encoder", False),
+                rosie_marker_subset=fusion_cfg.get("rosie_marker_subset"),
+                rosie_marker_subset_indices=fusion_cfg.get("rosie_marker_subset_indices"),
+            )
+        elif model_type == "CellViTSAMRosieEarlyFusion":
+            fusion_cfg = self.run_conf.get("fusion", {})
+            model_cfg = self.run_conf.get("model", {})
+            bb = str(model_cfg.get("backbone", "sam-h")).lower()
+            early_type = "vec_broadcast" if "vec" in bb else "map_compress"
+            early_compress = fusion_cfg.get("early_fusion_compress_out_channels", 8)
+            model = CellViTSAMRosieEarlyFusion(
+                model_path=None,
+                num_nuclei_classes=self.run_conf["data"]["num_nuclei_classes"],
+                num_tissue_classes=self.run_conf["data"]["num_tissue_classes"],
+                vit_structure=model_cfg.get("backbone", "sam-h"),
+                regression_loss=model_cfg.get("regression_loss", False),
+                freeze_cellvit=fusion_cfg.get("freeze_cellvit", True),
+                freeze_rosie=fusion_cfg.get("freeze_rosie", True),
+                rosie_weights_path=model_cfg.get("rosie_weights_path", None),
+                early_fusion_type=early_type,
+                early_fusion_compress_out_channels=early_compress,
+                rosie_marker_subset=fusion_cfg.get("rosie_marker_subset"),
+                rosie_marker_subset_indices=fusion_cfg.get("rosie_marker_subset_indices"),
+                early_fusion_detach_rosie=fusion_cfg.get("early_fusion_detach_rosie", True),
+            )
+        elif model_type == "CellViTVirchowRosieFiLM":
+            fusion_cfg = self.run_conf.get("fusion", {})
+            model_cfg = self.run_conf.get("model", {})
+            virchow_path = model_cfg.get("pretrained_encoder") or model_cfg.get("model_virchow_path")
+            film_layers = fusion_cfg.get("film_layers", ["z4"])
+            film_feat_dims = fusion_cfg.get("film_feat_dims", {})
+            model = CellViTVirchowRosieFiLM(
+                model_virchow_path=virchow_path,
+                num_nuclei_classes=self.run_conf["data"]["num_nuclei_classes"],
+                num_tissue_classes=self.run_conf["data"]["num_tissue_classes"],
+                rosie_hidden_dim=model_cfg.get("rosie_hidden_dim", 256),
+                freeze_rosie=fusion_cfg.get("freeze_rosie", True),
+                rosie_weights_path=model_cfg.get("rosie_weights_path", None),
+                film_enabled=fusion_cfg.get("film_enabled", True),
+                film_layers=tuple(film_layers),
+                film_feat_dims=film_feat_dims,
+                debug_print_z_shapes=fusion_cfg.get("debug_print_z_shapes", False),
+                rosie_make_spatial_prior=fusion_cfg.get("rosie_make_spatial_prior", False),
+                rosie_prior_from=fusion_cfg.get("rosie_prior_from", "rosie_backbone"),
+                rosie_prior_channels=int(fusion_cfg.get("rosie_prior_channels", 50)),
             )
         return model
 
