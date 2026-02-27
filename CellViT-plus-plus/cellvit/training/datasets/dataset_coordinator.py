@@ -51,6 +51,7 @@ def select_dataset(
             transforms=transforms,
             stardist=dataset_config.get("stardist", False),
             regression=dataset_config.get("regression_loss", False),
+            proxy_channels=dataset_config.get("proxy_channels"),
         )
     else:
         raise NotImplementedError(f"Unknown dataset: {dataset_name}")
