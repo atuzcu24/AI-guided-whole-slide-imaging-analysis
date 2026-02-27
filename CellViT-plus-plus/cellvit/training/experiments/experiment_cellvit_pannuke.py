@@ -28,9 +28,11 @@ from cellvit.models.cell_segmentation.cellvit_uni import CellViTUNI
 from cellvit.models.cell_segmentation.cellvit_virchow import CellViTVirchow
 from cellvit.models.cell_segmentation.cellvit_virchow2 import CellViTVirchow2
 from cellvit.models.cell_segmentation.cellvit_sam_rosie_film import CellViTSAMRosieFiLM #Fusion
+from cellvit.models.cell_segmentation.cellvit_sam_rosie_early_fusion import CellViTSAMRosieEarlyFusion
 from cellvit.models.cell_segmentation.cellvit_virchow_rosie_film import CellViTVirchowRosieFiLM #Fusion
 from cellvit.training.base_ml.base_early_stopping import EarlyStopping
 from cellvit.training.base_ml.base_experiment import BaseExperiment
+from cellvit.training.base_ml.base_optim import OPTI_DICT
 from cellvit.training.base_ml.base_loss import retrieve_loss_fn
 from cellvit.training.base_ml.base_trainer import BaseTrainer
 from cellvit.training.datasets.base_cell_dataset import CellDataset
@@ -150,6 +152,23 @@ class ExperimentCellVitPanNuke(BaseExperiment):
         )
         model.to(device)
 
+        # Optional: enable FiLM gamma/beta stats logging for Virchow Rosie FiLM
+        bb = self.run_conf.get("model", {}).get("backbone", "").lower()
+        fusion_cfg = self.run_conf.get("fusion", {})
+        log_film_every = fusion_cfg.get("log_film_stats_every", 0)
+        if bb == "virchow-rosie-film" and log_film_every > 0 and hasattr(model, "film_blocks"):
+            for block in model.film_blocks.values():
+                block.log_film_stats = True
+            self.logger.info(f"FiLM stats logging enabled every {log_film_every} steps")
+
+        # Optional: one-time print of trainable params (guarded by debug.print_trainables)
+        if self.run_conf.get("debug", {}).get("print_trainables", False):
+            trainable = [(n, p.numel()) for n, p in model.named_parameters() if p.requires_grad]
+            total = sum(c for _, c in trainable)
+            names = [n for n, _ in trainable]
+            self.logger.info(f"[debug] Trainable params: {total} across {len(names)} modules")
+            self.logger.info(f"[debug] Trainable module names: {names[:20]}{'...' if len(names) > 20 else ''}")
+
         # optimizer
         optimizer = self.get_optimizer(
             model,
@@ -235,12 +254,19 @@ class ExperimentCellVitPanNuke(BaseExperiment):
 
         # Call fit method
         self.logger.info("Calling Trainer Fit")
+        unfreeze_epoch = self.run_conf["training"]["unfreeze_epoch"]
+        bb = self.run_conf.get("model", {}).get("backbone", "").lower()
+        fusion_cfg = self.run_conf.get("fusion", {})
+        if bb in ("sam-h-rosie-film", "sam-h-proxy-film") and fusion_cfg.get("freeze_cellvit", True):
+            uce = fusion_cfg.get("unfreeze_cellvit_epoch", 0)
+            # Use fusion.unfreeze_cellvit_epoch when set; else training.unfreeze_epoch
+            unfreeze_epoch = uce if uce > 0 else unfreeze_epoch
         trainer.fit(
             epochs=self.run_conf["training"]["epochs"],
             train_dataloader=train_dataloader,
             val_dataloader=val_dataloader,
             metric_init=self.get_wandb_init_dict(),
-            unfreeze_epoch=self.run_conf["training"]["unfreeze_epoch"],
+            unfreeze_epoch=unfreeze_epoch,
             eval_every=self.run_conf["training"].get("eval_every", 1),
         )
 
@@ -420,6 +446,46 @@ class ExperimentCellVitPanNuke(BaseExperiment):
             }
         return loss_fn_dict
 
+    def get_optimizer(
+        self, model: nn.Module, optimizer_name: str, hp: dict
+    ) -> Optimizer:
+        """Optimizer with optional FiLM-only LR scaling for sam-h-rosie-film."""
+        bb = self.run_conf.get("model", {}).get("backbone", "").lower()
+        fusion_cfg = self.run_conf.get("fusion", {})
+        film_lr_mult = fusion_cfg.get("film_lr_mult", 1.0)
+
+        if bb not in ("sam-h-rosie-film", "virchow-rosie-film") or film_lr_mult == 1.0:
+            return super().get_optimizer(model, optimizer_name, hp)
+
+        if optimizer_name not in OPTI_DICT:
+            raise NotImplementedError("Optimizer not known")
+
+        base_lr = hp.get("lr", 3e-5)
+        weight_decay = hp.get("weight_decay", 0.0)
+        film_params = []
+        base_params = []
+        for name, p in model.named_parameters():
+            if not p.requires_grad:
+                continue
+            if "film_blocks." in name:
+                film_params.append(p)
+            else:
+                base_params.append(p)
+
+        param_groups = [
+            {"params": base_params, "lr": base_lr, "weight_decay": weight_decay},
+            {"params": film_params, "lr": base_lr * film_lr_mult, "weight_decay": weight_decay},
+        ]
+        hp_copy = {k: v for k, v in hp.items() if k not in ("lr", "weight_decay")}
+        optimizer = OPTI_DICT[optimizer_name](param_groups, **hp_copy)
+
+        self.logger.info(
+            f"Loaded {optimizer_name} with film_lr_mult={film_lr_mult} | "
+            f"base: {len(base_params)} params @ lr={base_lr} | "
+            f"FiLM: {len(film_params)} params @ lr={base_lr * film_lr_mult}"
+        )
+        return optimizer
+
     def get_scheduler(self, scheduler_type: str, optimizer: Optimizer) -> _LRScheduler:
         """Get the learning rate scheduler for CellViT
 
@@ -569,6 +635,9 @@ class ExperimentCellVitPanNuke(BaseExperiment):
             "sam-l",
             "sam-h",
             "sam-h-rosie-film",
+            "sam-h-proxy-film",
+            "sam-h-rosie-earlyfusion-vec",
+            "sam-h-rosie-earlyfusion-mapc",
             "uni",
             "virchow",
             "virchow2",
@@ -621,6 +690,8 @@ class ExperimentCellVitPanNuke(BaseExperiment):
             model.freeze_encoder()
             self.logger.info("Loaded CellVit256 model")
         if backbone_type.lower() in ["sam-b", "sam-l", "sam-h"]:
+            model_cfg = self.run_conf.get("model", {})
+            in_ch = model_cfg.get("input_channels", 3)
             model = CellViTSAM(
                 model_path=pretrained_encoder,
                 num_nuclei_classes=self.run_conf["data"]["num_nuclei_classes"],
@@ -628,8 +699,13 @@ class ExperimentCellVitPanNuke(BaseExperiment):
                 vit_structure=backbone_type,
                 drop_rate=self.run_conf["training"].get("drop_rate", 0),
                 regression_loss=regression_loss,
+                input_channels=in_ch,
             )
             model.load_pretrained_encoder(model.model_path)
+            if in_ch > 3:
+                from cellvit.models.cell_segmentation.cellvit_sam_rosie_early_fusion import expand_input_layer
+                expand_input_layer(model.encoder, model.input_channels, "zeros")
+                self.logger.info(f"Expanded encoder input to {in_ch} channels for proxy/early-fusion")
             if pretrained_model is not None:
                 self.logger.info(
                     f"Loading pretrained CellViT model from path: {pretrained_model}"
@@ -641,6 +717,33 @@ class ExperimentCellVitPanNuke(BaseExperiment):
         
         if backbone_type.lower() == "sam-h-rosie-film":
 
+            fusion_cfg = self.run_conf.get("fusion", {})
+            model_cfg  = self.run_conf.get("model", {})
+
+            # Prefer fusion.* (your YAML uses that), fallback to model.*
+            freeze_cellvit = fusion_cfg.get("freeze_cellvit", model_cfg.get("freeze_cellvit", True))
+            freeze_rosie   = fusion_cfg.get("freeze_rosie",   model_cfg.get("freeze_rosie", True))
+
+            film_enabled   = fusion_cfg.get("film_enabled", True)
+            film_layers    = fusion_cfg.get("film_layers", ["z4"])
+            film_feat_dims = fusion_cfg.get("film_feat_dims", {})
+            film_init      = fusion_cfg.get("film_init", "default")
+            film_mode      = fusion_cfg.get("film_mode", "full")
+            film_use_gating = fusion_cfg.get("film_use_gating", False)
+            film_gating_init = fusion_cfg.get("film_gating_init", 0.0)
+            film_gating_mode = fusion_cfg.get("film_gating_mode", "scalar")
+            film_scale     = fusion_cfg.get("film_scale", 1.0)
+            film_clamp_gamma = fusion_cfg.get("film_clamp_gamma")
+            unfreeze_cellvit_epoch = fusion_cfg.get("unfreeze_cellvit_epoch", 0)
+            unfreeze_last_n_blocks = fusion_cfg.get("unfreeze_last_n_blocks")
+            unfreeze_full_encoder = fusion_cfg.get("unfreeze_full_encoder", False)
+            debug_print_z_shapes = fusion_cfg.get("debug_print_z_shapes", False)
+            rosie_marker_subset = fusion_cfg.get("rosie_marker_subset")
+            rosie_marker_subset_indices = fusion_cfg.get("rosie_marker_subset_indices")
+            conditioning_mode_train = fusion_cfg.get("conditioning_mode_train", "normal")
+            conditioning_subset_indices = fusion_cfg.get("conditioning_subset_indices") or []
+            conditioning_dropout = fusion_cfg.get("conditioning_dropout")
+
             model = CellViTSAMRosieFiLM(
                 model_path=pretrained_encoder,
                 num_nuclei_classes=self.run_conf["data"]["num_nuclei_classes"],
@@ -648,17 +751,57 @@ class ExperimentCellVitPanNuke(BaseExperiment):
                 vit_structure="sam-h",   # FIXED
                 drop_rate=self.run_conf["training"].get("drop_rate", 0),
                 regression_loss=regression_loss,
-                rosie_hidden_dim=self.run_conf["model"].get("rosie_hidden_dim", 256),
+                rosie_hidden_dim=model_cfg.get("rosie_hidden_dim", 256),
+                rosie_weights_path=model_cfg.get("rosie_weights_path", None),
+
+                # YAML control behavior
+                freeze_cellvit=freeze_cellvit,
+                freeze_rosie=freeze_rosie,
+                film_enabled=film_enabled,
+                film_layers=tuple(film_layers),
+                film_feat_dims=film_feat_dims,
+                film_init=film_init,
+                film_mode=film_mode,
+                film_use_gating=film_use_gating,
+                film_gating_init=film_gating_init,
+                film_gating_mode=film_gating_mode,
+                film_scale=film_scale,
+                film_clamp_gamma=film_clamp_gamma,
+                unfreeze_cellvit_epoch=unfreeze_cellvit_epoch,
+                unfreeze_last_n_blocks=unfreeze_last_n_blocks,
+                unfreeze_full_encoder=unfreeze_full_encoder,
+                debug_print_z_shapes=debug_print_z_shapes,
+                rosie_marker_subset=rosie_marker_subset,
+                rosie_marker_subset_indices=rosie_marker_subset_indices,
+                conditioning_mode_train=conditioning_mode_train,
+                conditioning_subset_indices=conditioning_subset_indices,
+                conditioning_dropout=conditioning_dropout,
             )
 
             model.load_pretrained_encoder(model.model_path)
-            model.freeze_encoder()
 
-            self.logger.info("Loaded CellViT-SAM + Rosie-FiLM fusion model (sam-h backbone)")
+            # Only freeze encoder if requested
+            if freeze_cellvit:
+                model.freeze_encoder()
 
-            # -----------------------------------------
-            # Debug: trainable parameters
-            # -----------------------------------------
+            self.logger.info(
+                f"Loaded sam-h-rosie-film | film_enabled={film_enabled} | film_layers={sorted(model.film_layers) if model.film_layers else []} | film_feat_dims={dict(model.film_feat_dims)}"
+            )
+            if conditioning_mode_train != "normal":
+                self.logger.info(
+                    f"Training conditioning override: conditioning_mode_train={conditioning_mode_train} | conditioning_subset_indices={conditioning_subset_indices}"
+                )
+            if conditioning_dropout is not None:
+                self.logger.info(
+                    f"Conditioning dropout enabled: {conditioning_dropout}"
+                )
+
+            # -------------------------
+            # Debug: trainable params
+            # -------------------------
+            trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+            total_params = sum(p.numel() for p in model.parameters())
+            self.logger.info(f"FiLM config: film_layers={sorted(model.film_layers)}, film_feat_dims={model.film_feat_dims}, trainable_params={trainable_params:,} / {total_params:,}")
             self.logger.info("---- Trainable Parameters ----")
             for name, p in model.named_parameters():
                 if p.requires_grad:
@@ -668,18 +811,25 @@ class ExperimentCellVitPanNuke(BaseExperiment):
             total_params = sum(p.numel() for p in model.parameters())
             self.logger.info(f"Trainable params: {trainable_params:,} / {total_params:,}")
 
-            # FiLM internal weights
-            self.logger.info("FiLM MLP weights:")
-            for name, p in model.z4_film.named_parameters():
-                self.logger.info(f"FiLM {name}: {tuple(p.shape)}")
+            # -------------------------
+            # Debug: FiLM blocks (replaces z4_film)
+            # -------------------------
+            if getattr(model, "film_enabled", False) and len(getattr(model, "film_blocks", {})) > 0:
+                self.logger.info("FiLM blocks:")
+                for layer_name, block in model.film_blocks.items():
+                    self.logger.info(f"  - {layer_name}: {block.__class__.__name__}")
+                    for n, p in block.named_parameters():
+                        self.logger.info(f"    {layer_name}.{n}: {tuple(p.shape)}")
+            else:
+                self.logger.info("FiLM disabled (baseline behavior)")
 
             # Rosie head
             self.logger.info("ROSIE classifier head:")
             self.logger.info(str(model.rosie_model.classifier[2]))
 
-            # -----------------------------------------
-            # Optional: forward pass test
-            # -----------------------------------------
+            # -------------------------
+            # Optional: forward test
+            # -------------------------
             try:
                 dummy = torch.randn(1, 3, 128, 128).to(model.rosie_mean.device)
                 with torch.no_grad():
@@ -688,27 +838,106 @@ class ExperimentCellVitPanNuke(BaseExperiment):
             except Exception as e:
                 self.logger.error(f"Forward pass failed: {e}")
 
-            # FiLM stats
-            with torch.no_grad():
-                dummy_x = torch.randn(1, 3, 128, 128).to(model.rosie_mean.device)
-                x_rosie = model._rosie_preprocess(dummy_x)
-                rosie_vec = model.rosie_model(x_rosie)
-                film_vec = model.z4_film.mlp(rosie_vec)
-                self.logger.info(f"Rosie vec mean {rosie_vec.mean().item():.4f}, std {rosie_vec.std().item():.4f}")
-                self.logger.info(f"FiLM vec mean {film_vec.mean().item():.4f}, std {film_vec.std().item():.4f}")
+            # -------------------------
+            # Optional: FiLM stats
+            # -------------------------
+            if getattr(model, "film_enabled", False) and len(getattr(model, "film_blocks", {})) > 0:
+                with torch.no_grad():
+                    dummy_x = torch.randn(1, 3, 128, 128).to(model.rosie_mean.device)
+                    x_rosie = model._rosie_preprocess(dummy_x)
+                    rosie_full = model.rosie_model(x_rosie)
+                    rosie_vec = rosie_full[:, model.rosie_marker_indices]
 
-            # -----------------------------------------
+                    # pick first FiLM block to probe
+                    first_layer = next(iter(model.film_blocks.keys()))
+                    film_vec = model.film_blocks[first_layer].mlp(rosie_vec)
+
+                    self.logger.info(f"ROSIE subset dim={model.rosie_dim_for_film} | vec mean {rosie_vec.mean().item():.4f}, std {rosie_vec.std().item():.4f}")
+                    self.logger.info(f"FiLM vec mean {film_vec.mean().item():.4f}, std {film_vec.std().item():.4f}")
+
+            # -------------------------
             # Finalize & return
-            # -----------------------------------------
-            model = model.to("cpu")
-            self.logger.info(f"\n{summary(model, input_size=(1, 3, 128, 128), device='cpu')}")
-
+            # -------------------------
             return model
 
+        if backbone_type.lower() == "sam-h-proxy-film":
+            from cellvit.models.cell_segmentation.cellvit_sam_proxy_film import (
+                CellViTSAMProxyFiLM,
+            )
+            fusion_cfg = self.run_conf.get("fusion", {})
+            model_cfg = self.run_conf.get("model", {})
+            transform_cfg = self.run_conf.get("transformations", {})
+            norm_cfg = transform_cfg.get("normalize", {})
+            norm_mean = norm_cfg.get("mean", [0.5, 0.5, 0.5])
+            norm_std = norm_cfg.get("std", [0.5, 0.5, 0.5])
+            film_layers = fusion_cfg.get("film_layers", ["z4"])
+            film_feat_dims = fusion_cfg.get("film_feat_dims", {})
+            if not film_feat_dims and film_layers:
+                film_feat_dims = {k: 1280 for k in film_layers}
+            model = CellViTSAMProxyFiLM(
+                model_path=pretrained_encoder,
+                num_nuclei_classes=self.run_conf["data"]["num_nuclei_classes"],
+                num_tissue_classes=self.run_conf["data"]["num_tissue_classes"],
+                vit_structure="sam-h",
+                drop_rate=self.run_conf["training"].get("drop_rate", 0),
+                regression_loss=regression_loss,
+                film_layers=tuple(film_layers),
+                film_feat_dims=film_feat_dims,
+                film_init=fusion_cfg.get("film_init", "default"),
+                rosie_hidden_dim=model_cfg.get("rosie_hidden_dim", 256),
+                conditioning_mode_train=fusion_cfg.get("conditioning_mode_train", "normal"),
+                conditioning_mode_infer=fusion_cfg.get("conditioning_mode_infer", "normal"),
+                normalize_mean=norm_mean,
+                normalize_std=norm_std,
+            )
+            model.load_pretrained_encoder(model.model_path)
+            model.freeze_encoder()
+            self.logger.info(
+                f"Loaded sam-h-proxy-film | film_layers={sorted(model.film_layers)} | "
+                f"conditioning_mode_train={model.conditioning_mode_train} infer={model.conditioning_mode_infer}"
+            )
+            return model
 
+        if backbone_type.lower() in ("sam-h-rosie-earlyfusion-vec", "sam-h-rosie-earlyfusion-mapc"):
+            fusion_cfg = self.run_conf.get("fusion", {})
+            model_cfg = self.run_conf.get("model", {})
+            early_type = "vec_broadcast" if "vec" in backbone_type.lower() else "map_compress"
+            early_compress = fusion_cfg.get("early_fusion_compress_out_channels", 8)
 
-        
-        
+            model = CellViTSAMRosieEarlyFusion(
+                model_path=pretrained_encoder,
+                num_nuclei_classes=self.run_conf["data"]["num_nuclei_classes"],
+                num_tissue_classes=self.run_conf["data"]["num_tissue_classes"],
+                vit_structure="sam-h",
+                drop_rate=self.run_conf["training"].get("drop_rate", 0),
+                regression_loss=regression_loss,
+                freeze_cellvit=fusion_cfg.get("freeze_cellvit", True),
+                freeze_rosie=fusion_cfg.get("freeze_rosie", True),
+                rosie_weights_path=model_cfg.get("rosie_weights_path", None),
+                early_fusion_type=early_type,
+                early_fusion_compress_out_channels=early_compress,
+                rosie_marker_subset=fusion_cfg.get("rosie_marker_subset"),
+                rosie_marker_subset_indices=fusion_cfg.get("rosie_marker_subset_indices"),
+                early_fusion_detach_rosie=fusion_cfg.get("early_fusion_detach_rosie", True),
+            )
+            model.load_pretrained_encoder(model.model_path)
+            if fusion_cfg.get("freeze_cellvit", True):
+                model.freeze_encoder()
+            self.logger.info(
+                f"Loaded sam-h-rosie-earlyfusion | type={early_type} | "
+                f"extra_channels={model.extra_channels} | rosie_markers={model.rosie_dim}"
+            )
+            try:
+                dummy = torch.randn(1, 3, 256, 256).to(
+                    model.rosie_mean.device if hasattr(model, "rosie_mean") else "cpu"
+                )
+                with torch.no_grad():
+                    out = model(dummy)
+                self.logger.info(f"Dummy forward OK: fused_x channels=3+{model.extra_channels} | nuclei_type_map {out['nuclei_type_map'].shape}")
+            except Exception as e:
+                self.logger.error(f"Forward pass failed: {e}")
+            return model
+
         if backbone_type.lower() == "uni":
             model = CellViTUNI(
                 model_uni_path=pretrained_encoder,
@@ -757,26 +986,95 @@ class ExperimentCellVitPanNuke(BaseExperiment):
             )
         if backbone_type.lower() == "virchow-rosie-film":
 
+            fusion_cfg = self.run_conf.get("fusion", {})
+            model_cfg  = self.run_conf.get("model", {})
+
+            # prefer fusion.*, fallback to model.*
+            freeze_encoder = fusion_cfg.get("freeze_cellvit", model_cfg.get("freeze_encoder", True))
+            freeze_rosie   = fusion_cfg.get("freeze_rosie", True)
+
+            film_enabled   = fusion_cfg.get("film_enabled", True)
+            film_layers    = fusion_cfg.get("film_layers", ["z4"])
+            film_feat_dims = fusion_cfg.get("film_feat_dims", {})
+            film_init      = fusion_cfg.get("film_init", "default")  # "identity" for gamma=1,beta=0 (recommended ablation)
+            film_mode      = fusion_cfg.get("film_mode", "full")     # "full" or "beta_only"
+            film_force_identity_train = fusion_cfg.get("film_force_identity_train", False)  # always gamma=1, beta=0 (train+eval)
+            conditioning_mode_train = fusion_cfg.get("conditioning_mode_train", "normal")
+            debug_print_z_shapes = fusion_cfg.get("debug_print_z_shapes", False)
+            rosie_subset_indices = fusion_cfg.get("rosie_subset_indices")
+            rosie_topk = fusion_cfg.get("rosie_topk")
+            rosie_topk_method = fusion_cfg.get("rosie_topk_method", "energy")
+            rosie_topk_cache_path = fusion_cfg.get("rosie_topk_cache_path")
+            # Per-run cache path under log_dir to avoid race when multiple jobs share a file
+            if rosie_topk is not None and rosie_topk > 0:
+                log_dir = Path(self.run_conf["logging"]["log_dir"])
+                rosie_topk_cache_path = str(
+                    log_dir / f"rosie_topk_cache_{rosie_topk_method}_k{rosie_topk}.json"
+                )
+            rosie_topk_dataset_path = self.run_conf["data"].get("dataset_path")
+            rosie_topk_seed = self.run_conf.get("random_seed")
+
             model = CellViTVirchowRosieFiLM(
                 model_virchow_path=pretrained_encoder,
                 num_nuclei_classes=self.run_conf["data"]["num_nuclei_classes"],
                 num_tissue_classes=self.run_conf["data"]["num_tissue_classes"],
-                rosie_dim=self.run_conf["model"].get("rosie_dim", 50),
-                film_hidden_dim=self.run_conf["model"].get("film_hidden_dim", 256),
+
+                # Rosie / FiLM settings
+                rosie_hidden_dim=model_cfg.get("rosie_hidden_dim", 256),
+                rosie_weights_path=model_cfg.get("rosie_weights_path", None),
+                freeze_rosie=freeze_rosie,
+
+                # FiLM controls (config-driven ablations)
+                film_enabled=film_enabled,
+                film_layers=tuple(film_layers),
+                film_feat_dims=film_feat_dims,
+                film_init=film_init,
+                film_mode=film_mode,
+                film_force_identity_train=film_force_identity_train,
+                conditioning_mode_train=conditioning_mode_train,
+                debug_print_z_shapes=debug_print_z_shapes,
+                rosie_subset_indices=rosie_subset_indices,
+                rosie_topk=rosie_topk,
+                rosie_topk_method=rosie_topk_method,
+                rosie_topk_cache_path=rosie_topk_cache_path,
+                rosie_topk_dataset_path=rosie_topk_dataset_path,
+                rosie_topk_seed=rosie_topk_seed,
+
+                # NP spatial prior for L_sup / L_bd losses
+                rosie_make_spatial_prior=fusion_cfg.get("rosie_make_spatial_prior", False),
+                rosie_prior_from=fusion_cfg.get("rosie_prior_from", "rosie_backbone"),
+                rosie_prior_channels=int(fusion_cfg.get("rosie_prior_channels", 50)),
             )
 
             model.load_pretrained_encoder(pretrained_encoder)
 
-            if self.run_conf["model"].get("freeze_encoder", True):
+            if freeze_encoder:
                 model.freeze_encoder()
 
-            self.logger.info("Loaded CellViTVirchowRosieFiLM model (Virchow backbone + FiLM)")
+            if conditioning_mode_train != "normal":
+                self.logger.info(
+                    f"Loaded virchow-rosie-film | film_enabled={film_enabled} | film_layers={film_layers} | conditioning_mode_train={conditioning_mode_train}"
+                )
+            else:
+                self.logger.info(
+                    f"Loaded virchow-rosie-film | film_enabled={film_enabled} | film_layers={film_layers}"
+                )
+
 
         self.logger.info(f"\nModel: {model}")
         model = model.to("cpu")
-        self.logger.info(
-            f"\n{summary(model, input_size=(1, 3, 256, 256), device='cpu')}"
+        C = self.run_conf.get("model", {}).get("input_channels") or getattr(
+            model, "input_channels", 3
         )
+        H = W = self.run_conf.get("data", {}).get("input_shape", 256)
+        try:
+            self.logger.info(
+                f"\n{summary(model, input_size=(1, C, H, W), device='cpu')}"
+            )
+        except Exception as e:
+            self.logger.warning(
+                f"torchinfo.summary failed (training will proceed): {e}"
+            )
 
         return model
 
