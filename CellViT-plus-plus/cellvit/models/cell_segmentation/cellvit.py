@@ -113,9 +113,11 @@ class CellViT(nn.Module):
 
         # version with shared skip_connections
         self.decoder0 = nn.Sequential(
-            Conv2DBlock(3, 32, 3, dropout=self.drop_rate),
+            Conv2DBlock(self.input_channels, 32, 3, dropout=self.drop_rate),
             Conv2DBlock(32, 64, 3, dropout=self.drop_rate),
         )  # skip connection after positional encoding, shape should be H, W, 64
+        _first_conv = self.decoder0[0].block[0]
+        print(f"[CellViT] decoder0 first conv in_channels={_first_conv.in_channels} | model.input_channels={self.input_channels}")
         self.decoder1 = nn.Sequential(
             Deconv2DBlock(self.embed_dim, self.skip_dim_11, dropout=self.drop_rate),
             Deconv2DBlock(self.skip_dim_11, self.skip_dim_12, dropout=self.drop_rate),
