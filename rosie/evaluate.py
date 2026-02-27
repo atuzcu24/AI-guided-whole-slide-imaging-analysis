@@ -395,7 +395,13 @@ def main():
     #     print("Using", torch.cuda.device_count(), "GPUs")
     model = nn.DataParallel(model)
     # pdb.set_trace()
-    model.load_state_dict(torch.load(args.model_path)['model_state_dict'])
+    ckpt = torch.load(args.model_path, map_location="cpu", weights_only=False)
+
+    # Support both common checkpoint formats:
+    state = ckpt.get("model_state_dict", ckpt) if isinstance(ckpt, dict) else ckpt
+
+    model.load_state_dict(state, strict=True)
+
     model = model.to(device)
     
     # Check if input_dir is a file or directory
