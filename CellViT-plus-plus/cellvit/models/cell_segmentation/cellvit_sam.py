@@ -42,6 +42,7 @@ class CellViTSAM(CellViT):
         vit_structure: Literal["SAM-B", "SAM-L", "SAM-H"],
         drop_rate: float = 0,
         regression_loss: bool = False,
+        input_channels: int = 3,
     ):
         if vit_structure.upper() == "SAM-B":
             self.init_vit_b()
@@ -52,7 +53,7 @@ class CellViTSAM(CellViT):
         else:
             raise NotImplementedError("Unknown ViT-SAM backbone structure")
 
-        self.input_channels = 3  # RGB
+        self.input_channels = input_channels
         self.mlp_ratio = 4
         self.qkv_bias = True
         self.num_nuclei_classes = num_nuclei_classes
