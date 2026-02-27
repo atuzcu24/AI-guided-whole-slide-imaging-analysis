@@ -29,6 +29,7 @@ from cellvit.models.cell_segmentation.cellvit_sam import CellViTSAM
 from cellvit.models.cell_segmentation.cellvit_uni import CellViTUNI
 from cellvit.models.cell_segmentation.cellvit_virchow import CellViTVirchow
 from cellvit.models.cell_segmentation.cellvit_virchow2 import CellViTVirchow2
+from cellvit.models.cell_segmentation.cellvit_sam_rosie_film import CellViTSAMRosieFiLM
 from cellvit.models.classifier.linear_classifier import LinearClassifier
 from cellvit.training.base_ml.base_early_stopping import EarlyStopping
 from cellvit.training.base_ml.base_experiment import BaseExperiment
@@ -922,13 +923,18 @@ class ExperimentCellVitClassifier(BaseExperiment):
                 * CellViT-Model
                 * Dictionary with CellViT-Model configuration
         """
-        model_checkpoint = torch.load(checkpoint_path, map_location="cpu")
+        model_checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
 
         # unpack checkpoint
         cellvit_run_conf = unflatten_dict(model_checkpoint["config"], ".")
         model = self._get_cellvit_architecture(
             model_type=model_checkpoint["arch"], model_conf=cellvit_run_conf
         )
+        if model_checkpoint["arch"] == "CellViTSAMRosieEarlyFusion":
+            from cellvit.models.cell_segmentation.cellvit_sam_rosie_early_fusion import expand_input_layer
+            if not getattr(model, "_encoder_expanded", False):
+                expand_input_layer(model.encoder, model.input_channels, "zeros")
+                model._encoder_expanded = True
         self.logger.info(f"Loading checkpoint {Path(checkpoint_path).resolve()}")
         self.logger.info(model.load_state_dict(model_checkpoint["model_state_dict"]))
         model.eval()
@@ -965,6 +971,8 @@ class ExperimentCellVitClassifier(BaseExperiment):
             "CellViTUNI",
             "CellViTVirchow",
             "CellViTVirchow2",
+            "CellViTSAMRosieFiLM",
+            "CellViTSAMRosieEarlyFusion",
         ]
         if model_type not in implemented_models:
             raise NotImplementedError(
@@ -1014,5 +1022,62 @@ class ExperimentCellVitClassifier(BaseExperiment):
                 model_virchow_path=None,
                 num_nuclei_classes=model_conf["data"]["num_nuclei_classes"],
                 num_tissue_classes=model_conf["data"]["num_tissue_classes"],
+            )
+
+        elif model_type == "CellViTSAMRosieFiLM":
+            fusion_cfg = model_conf.get("fusion", {})
+            model_cfg = model_conf.get("model", {})
+            film_layers = fusion_cfg.get("film_layers", ["z4"])
+            film_feat_dims = fusion_cfg.get("film_feat_dims", {})
+            if not film_feat_dims and film_layers:
+                bb = str(model_cfg.get("backbone", "sam-h")).upper()
+                embed = {"SAM-B": 768, "SAM-L": 1024, "SAM-H": 1280}.get(bb, 1280)
+                film_feat_dims = {k: (256 if k == "z4" else embed) for k in film_layers}
+            model = CellViTSAMRosieFiLM(
+                model_path=None,
+                num_nuclei_classes=self.run_conf["data"]["num_nuclei_classes"],
+                num_tissue_classes=self.run_conf["data"]["num_tissue_classes"],
+                vit_structure=model_cfg.get("backbone", "sam-h"),
+                regression_loss=model_cfg.get("regression_loss", False),
+                rosie_hidden_dim=model_cfg.get("rosie_hidden_dim", 256),
+                rosie_weights_path=model_cfg.get("rosie_weights_path", None),
+                freeze_cellvit=fusion_cfg.get("freeze_cellvit", model_cfg.get("freeze_cellvit", False)),
+                freeze_rosie=fusion_cfg.get("freeze_rosie", model_cfg.get("freeze_rosie", False)),
+                film_enabled=fusion_cfg.get("film_enabled", True),
+                film_layers=tuple(film_layers),
+                film_feat_dims=film_feat_dims,
+                film_init=fusion_cfg.get("film_init", "default"),
+                film_use_gating=fusion_cfg.get("film_use_gating", False),
+                film_gating_init=fusion_cfg.get("film_gating_init", 0.0),
+                film_gating_mode=fusion_cfg.get("film_gating_mode", "scalar"),
+                film_scale=fusion_cfg.get("film_scale", 1.0),
+                film_clamp_gamma=fusion_cfg.get("film_clamp_gamma"),
+                unfreeze_last_n_blocks=fusion_cfg.get("unfreeze_last_n_blocks"),
+                unfreeze_full_encoder=fusion_cfg.get("unfreeze_full_encoder", False),
+                rosie_marker_subset=fusion_cfg.get("rosie_marker_subset"),
+                rosie_marker_subset_indices=fusion_cfg.get("rosie_marker_subset_indices"),
+            )
+        elif model_type == "CellViTSAMRosieEarlyFusion":
+            from cellvit.models.cell_segmentation.cellvit_sam_rosie_early_fusion import CellViTSAMRosieEarlyFusion
+
+            fusion_cfg = model_conf.get("fusion", {})
+            model_cfg = model_conf.get("model", {})
+            bb = str(model_cfg.get("backbone", "sam-h")).lower()
+            early_type = "vec_broadcast" if "vec" in bb else "map_compress"
+            early_compress = fusion_cfg.get("early_fusion_compress_out_channels", 8)
+            model = CellViTSAMRosieEarlyFusion(
+                model_path=None,
+                num_nuclei_classes=model_conf["data"]["num_nuclei_classes"],
+                num_tissue_classes=model_conf["data"]["num_tissue_classes"],
+                vit_structure="sam-h",
+                regression_loss=model_cfg.get("regression_loss", False),
+                freeze_cellvit=fusion_cfg.get("freeze_cellvit", True),
+                freeze_rosie=fusion_cfg.get("freeze_rosie", True),
+                rosie_weights_path=model_cfg.get("rosie_weights_path", None),
+                early_fusion_type=early_type,
+                early_fusion_compress_out_channels=early_compress,
+                rosie_marker_subset=fusion_cfg.get("rosie_marker_subset"),
+                rosie_marker_subset_indices=fusion_cfg.get("rosie_marker_subset_indices"),
+                early_fusion_detach_rosie=fusion_cfg.get("early_fusion_detach_rosie", True),
             )
         return model
