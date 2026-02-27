@@ -43,6 +43,17 @@ BACKBONE_EMBED_DIM = {
     "uni": 1024,
     "Virchow": 1280,
     "Virchow2": 1280,
+    # Added custom fused backbones
+    "sam-h-rosie-film": 16, #originally it is 1280 but for classification
+    "sam-h-rosie-earlyfusion-vec": 1280,
+    "sam-h-rosie-earlyfusion-mapc": 1280,
+    "sam-l-rosie-film": 1024,
+    "sam-b-rosie-film": 768,
+
+    # (optional: add LoRA versions)
+    "sam-h-rosie-lora": 1280,
+    "sam-l-rosie-lora": 1024,
+    "sam-b-rosie-lora": 768,
 }
 
 CELL_IMAGE_SIZES = [
