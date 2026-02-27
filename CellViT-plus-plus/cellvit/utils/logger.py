@@ -104,10 +104,12 @@ class Logger:
         formatter: str = None,
         use_timestamp: bool = False,
         file_level: Literal["CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"] = None,
+        logger_name: str = None,
     ) -> None:
         self.level = level
         self.comment = comment
         self.log_parent_dir = log_dir
+        self.logger_name = logger_name
         self.use_timestamp = use_timestamp
         if formatter is None:
             self.formatter = "%(asctime)s [%(levelname)s] - %(message)s"
@@ -156,7 +158,8 @@ class Logger:
         Returns:
             Logger: The logger to be used.
         """
-        logger = logging.getLogger("__main__")
+        name = self.logger_name if self.logger_name is not None else "__main__"
+        logger = logging.getLogger(name)
         logger.addHandler(logging.NullHandler())
 
         logger.setLevel(
