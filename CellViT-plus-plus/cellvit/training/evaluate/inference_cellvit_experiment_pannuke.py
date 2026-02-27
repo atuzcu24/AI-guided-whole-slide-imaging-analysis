@@ -9,6 +9,7 @@
 # University Medicine Essen
 
 import argparse
+import csv
 import os
 import sys
 
@@ -37,7 +38,7 @@ from PIL import Image, ImageDraw
 from skimage.color import rgba2rgb
 from sklearn.metrics import accuracy_score
 from tabulate import tabulate
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from torchmetrics.functional import dice
 from torchmetrics.functional.classification import binary_jaccard_index
 from torchvision import transforms
@@ -69,6 +70,16 @@ class InferenceCellViT:
         gpu: int,
         magnification: int = 40,
         checkpoint_name: str = "model_best.pth",
+        conditioning_mode: str = "normal",
+        subset_indices: str = "",
+        log_film_stats: bool = False,
+        results_suffix: str | None = None,
+        film_identity: bool = False,
+        film_force_identity: bool = False,
+        plot_image_ids: Union[Path, str, None] = None,
+        debug_pq_remap: bool = False,
+        pq_iou_thr: float = 0.5,
+        pq_iou_sweep: str | None = None,
     ) -> None:
         """Inference for HoverNet
 
@@ -77,13 +88,40 @@ class InferenceCellViT:
             gpu (int): CUDA GPU device to use for inference
             magnification (int, optional): Dataset magnification. Defaults to 40.
             checkpoint_name (str, optional): Select name of the model to load. Defaults to model_best.pth
+            conditioning_mode (str, optional): FiLM ablation: normal, zeros, shuffle, subset9.
+            subset_indices (str, optional): For subset9: comma-separated indices.
+            log_film_stats (bool, optional): Log FiLM gamma/beta stats.
+            results_suffix (str, optional): Filename suffix (default: conditioning_mode or identity).
+            film_identity (bool, optional): Force FiLM to identity (gamma=1, beta=0) during inference.
+            film_force_identity (bool, optional): Same as film_identity (CLI uses --film_force_identity).
         """
         self.run_dir = Path(run_dir)
         self.device = f"cuda:{gpu}"
+        self.plot_image_ids_set = set()
+        if plot_image_ids:
+            p = Path(plot_image_ids)
+            if p.exists():
+                self.plot_image_ids_set = {ln.strip() for ln in p.read_text().splitlines() if ln.strip()}
         self.run_conf: dict = None
         self.logger: Logger = None
         self.magnification = magnification
         self.checkpoint_name = checkpoint_name
+        self.conditioning_mode = conditioning_mode
+        self.subset_indices = subset_indices
+        self.log_film_stats = log_film_stats
+        self.film_identity = film_identity or film_force_identity
+        self.debug_pq_remap = debug_pq_remap
+        self.pq_iou_thr = float(pq_iou_thr)
+        if pq_iou_sweep is not None and pq_iou_sweep.strip():
+            self.pq_iou_thresholds = [float(x.strip()) for x in pq_iou_sweep.split(",") if x.strip()]
+        else:
+            self.pq_iou_thresholds = [self.pq_iou_thr]
+        if results_suffix is not None:
+            self.results_suffix = results_suffix
+        elif film_identity:
+            self.results_suffix = "identity"
+        else:
+            self.results_suffix = conditioning_mode
 
         self.__load_run_conf()
 
@@ -94,6 +132,20 @@ class InferenceCellViT:
 
         self.logger.info(f"Loaded run: {run_dir}")
         self.num_classes = self.run_conf["data"]["num_nuclei_classes"]
+
+        # Output dir for film_force_identity ablation (avoid overwriting main results)
+        self.results_output_dir = self.run_dir
+        if self.film_identity:
+            self.results_output_dir = self.run_dir / "results_film_identity"
+            self.results_output_dir.mkdir(parents=True, exist_ok=True)
+            print(f"film_force_identity=true | saving to {self.results_output_dir}")
+            self.logger.info(f"film_force_identity=true | saving to {self.results_output_dir}")
+            try:
+                import wandb
+                if wandb.run is not None:
+                    wandb.config.update({"film_force_identity": True}, allow_val_change=True)
+            except ImportError:
+                pass
 
     def __load_run_conf(self) -> None:
         """Load the config.yaml file with the run setup
@@ -124,13 +176,16 @@ class InferenceCellViT:
         """Instantiate logger
 
         Logger is using no formatters. Logs are stored in the run directory under the filename: inference.log
+        Uses a unique logger name per run_dir to avoid handler accumulation when loading multiple models.
         """
+        run_path = Path(self.run_dir).resolve()
         logger = Logger(
             level=self.run_conf["logging"]["level"].upper(),
-            log_dir=Path(self.run_dir).resolve(),
+            log_dir=run_path,
             comment="inference",
             use_timestamp=False,
             formatter="%(message)s",
+            logger_name=f"cellvit_inference_{run_path.name}",
         )
         self.logger = logger.create_logger()
 
@@ -142,14 +197,51 @@ class InferenceCellViT:
         """Setup automated mixed precision (amp) for inference."""
         self.mixed_precision = self.run_conf["training"].get("mixed_precision", False)
 
+    def sanitize_backbone_for_sam(self, backbone: str) -> str: # Newly added, for FiLM
+        s = (backbone or "sam-h").strip().lower().replace("_", "-")
+        if s.startswith("sam-"):
+            parts = s.split("-")
+            return "-".join(parts[:2])  # sam-h / sam-l / sam-b
+        return s
+
+    def _remap_film_checkpoint_keys(self, state_dict: dict) -> dict:
+        """Remap old z4_film-style keys to film_blocks.z4 for legacy checkpoints."""
+        remapped = {}
+        for k, v in state_dict.items():
+            new_k = k
+            for layer in ("z1", "z2", "z3", "z4"):
+                old_prefix = f"{layer}_film."
+                new_prefix = f"film_blocks.{layer}."
+                if k.startswith(old_prefix):
+                    new_k = new_prefix + k[len(old_prefix):]
+                    break
+            remapped[new_k] = v
+        return remapped
+
+    def _infer_film_feat_dims_from_checkpoint(self, state_dict: dict) -> dict:
+        """Infer film_feat_dims from checkpoint shapes (RosieFiLM mlp.2 has out=feat_dim*2)."""
+        if any(k.startswith(f"{l}_film.") for l in ("z1","z2","z3","z4") for k in state_dict):
+            sd = self._remap_film_checkpoint_keys(state_dict)
+        else:
+            sd = state_dict
+        film_feat_dims = {}
+        for layer in ("z1", "z2", "z3", "z4"):
+            key = f"film_blocks.{layer}.mlp.2.weight"
+            if key in sd:
+                # shape: [feat_dim*2, hidden_dim] -> feat_dim = shape[0]//2
+                film_feat_dims[layer] = int(sd[key].shape[0]) // 2
+        return film_feat_dims
+
     def get_model(
-        self, model_type: str
+        self, model_type: str, use_lora: bool = False
     ) -> Union[CellViT, CellViT256, CellViTSAM, CellViTUNI, CellViTVirchow]:
         """Return the trained model for inference
 
         Args:
             model_type (str): Name of the model. Must either be one of:
                 CellViT, CellViT256, CellViTSAM, CellViTUNI, CellViTVirchow, CellViTVirchow2
+            use_lora (bool, optional): For CellViTSAMRosieFiLM, use LoRA variant when checkpoint
+                was trained with LoRA. Defaults to False.
 
         Returns:
             Union[CellViT, CellViT256, CellViTSAM, CellViTUNI, CellViTVirchow, CellViTVirchow2]: Model
@@ -161,7 +253,10 @@ class InferenceCellViT:
             "CellViTUNI",
             "CellViTVirchow",
             "CellViTVirchow2",
-            "CellViTSAMRosieFiLM", #Newly added
+            "CellViTSAMRosieFiLM",
+            "CellViTSAMProxyFiLM",
+            "CellViTSAMRosieEarlyFusion",
+            "CellViTVirchowRosieFiLM",
         ]
         if model_type not in implemented_models:
             raise NotImplementedError(
@@ -187,12 +282,15 @@ class InferenceCellViT:
                 regression_loss=self.run_conf["model"].get("regression_loss", False),
             )
         elif model_type in ["CellViTSAM"]:
+            model_cfg = self.run_conf.get("model", {})
+            input_ch = model_cfg.get("input_channels", 3)
             model = CellViTSAM(
                 model_path=None,
                 num_nuclei_classes=self.run_conf["data"]["num_nuclei_classes"],
                 num_tissue_classes=self.run_conf["data"]["num_tissue_classes"],
-                vit_structure=self.run_conf["model"]["backbone"],
+                vit_structure=self.sanitize_backbone_for_sam(self.run_conf["model"].get("backbone", "sam-h")),
                 regression_loss=self.run_conf["model"].get("regression_loss", False),
+                input_channels=input_ch,
             )
         elif model_type == "CellViTUNI":
             model = CellViTUNI(
@@ -213,17 +311,198 @@ class InferenceCellViT:
                 num_tissue_classes=self.run_conf["data"]["num_tissue_classes"],
             )
         elif model_type == "CellViTSAMRosieFiLM":
-            from cellvit.models.cell_segmentation.cellvit_sam_rosie_film import CellViTSAMRosieFiLM
+            model_cfg = self.run_conf.get("model", {})
+            fusion_cfg = self.run_conf.get("fusion", {})
 
-            model = CellViTSAMRosieFiLM(
+            # LoRA variant: use when config has use_lora or checkpoint has LoRA keys
+            if use_lora:
+                from cellvit.models.cell_segmentation.cellvit_sam_rosie_film_lora import (
+                    CellViTSAMRosieFiLM as CellViTSAMRosieFiLMLoRA,
+                )
+
+                pretrained_encoder = model_cfg.get("pretrained_encoder")
+                model = CellViTSAMRosieFiLMLoRA(
+                    model_path=pretrained_encoder,
+                    num_nuclei_classes=self.run_conf["data"]["num_nuclei_classes"],
+                    num_tissue_classes=self.run_conf["data"]["num_tissue_classes"],
+                    vit_structure=self.sanitize_backbone_for_sam(
+                        model_cfg.get("backbone", "sam-h")
+                    ),
+                    drop_rate=self.run_conf["training"].get("drop_rate", 0),
+                    regression_loss=model_cfg.get("regression_loss", False),
+                    rosie_hidden_dim=model_cfg.get("rosie_hidden_dim", 256),
+                    freeze_cellvit=model_cfg.get("freeze_cellvit", True),
+                    freeze_rosie=model_cfg.get("freeze_rosie", True),
+                    use_lora=True,
+                    lora_r=model_cfg.get("lora_r", 8),
+                    lora_alpha=model_cfg.get("lora_alpha", 16),
+                    lora_dropout=model_cfg.get("lora_dropout", 0.1),
+                )
+                self.logger.info("Using CellViTSAMRosieFiLM (LoRA variant) for inference")
+            else:
+                from cellvit.models.cell_segmentation.cellvit_sam_rosie_film import (
+                    CellViTSAMRosieFiLM,
+                )
+
+                # allow both places (model.* or fusion.*) for minimal changes
+                freeze_cellvit = fusion_cfg.get("freeze_cellvit", model_cfg.get("freeze_cellvit", False))
+                freeze_rosie = fusion_cfg.get("freeze_rosie", model_cfg.get("freeze_rosie", False))
+
+                # NEW: FiLM controls live in fusion_cfg
+                film_enabled = fusion_cfg.get("film_enabled", True)
+                film_layers = fusion_cfg.get("film_layers", ["z4"])  # list in YAML
+                film_feat_dims = fusion_cfg.get("film_feat_dims", {})  # dict in YAML
+
+                # Fallback: old configs may lack film_feat_dims; infer from backbone
+                if film_enabled and film_layers and not film_feat_dims:
+                    bb = self.sanitize_backbone_for_sam(
+                        self.run_conf["model"].get("backbone", "sam-h")
+                    ).upper()
+                    embed = {"SAM-B": 768, "SAM-L": 1024, "SAM-H": 1280}.get(bb, 1280)
+                    film_feat_dims = {k: (256 if k == "z4" else embed) for k in film_layers}
+
+                film_init = fusion_cfg.get("film_init", "default")
+                film_use_gating = fusion_cfg.get("film_use_gating", False)
+                film_gating_init = fusion_cfg.get("film_gating_init", 0.0)
+                film_gating_mode = fusion_cfg.get("film_gating_mode", "scalar")
+                film_scale = fusion_cfg.get("film_scale", 1.0)
+                film_clamp_gamma = fusion_cfg.get("film_clamp_gamma")
+                unfreeze_last_n_blocks = fusion_cfg.get("unfreeze_last_n_blocks")
+                unfreeze_full_encoder = fusion_cfg.get("unfreeze_full_encoder", False)
+                debug_print_z_shapes = fusion_cfg.get("debug_print_z_shapes", False)
+                rosie_marker_subset = fusion_cfg.get("rosie_marker_subset")
+                rosie_marker_subset_indices = fusion_cfg.get("rosie_marker_subset_indices")
+
+                model = CellViTSAMRosieFiLM(
+                    model_path=None,
+                    num_nuclei_classes=self.run_conf["data"]["num_nuclei_classes"],
+                    num_tissue_classes=self.run_conf["data"]["num_tissue_classes"],
+                    vit_structure=self.sanitize_backbone_for_sam(
+                        self.run_conf["model"].get("backbone", "sam-h")
+                    ),
+                    regression_loss=model_cfg.get("regression_loss", False),
+                    rosie_hidden_dim=model_cfg.get("rosie_hidden_dim", 256),
+
+                    freeze_cellvit=freeze_cellvit,
+                    freeze_rosie=freeze_rosie,
+                    rosie_weights_path=model_cfg.get("rosie_weights_path", None),
+
+                    film_enabled=film_enabled,
+                    film_layers=tuple(film_layers),
+                    film_feat_dims=film_feat_dims,
+                    film_init=film_init,
+                    film_use_gating=film_use_gating,
+                    film_gating_init=film_gating_init,
+                    film_gating_mode=film_gating_mode,
+                    film_scale=film_scale,
+                    film_clamp_gamma=film_clamp_gamma,
+                    unfreeze_last_n_blocks=unfreeze_last_n_blocks,
+                    unfreeze_full_encoder=unfreeze_full_encoder,
+                    debug_print_z_shapes=debug_print_z_shapes,
+                    rosie_marker_subset=rosie_marker_subset,
+                    rosie_marker_subset_indices=rosie_marker_subset_indices,
+                )
+
+        elif model_type == "CellViTSAMProxyFiLM":
+            from cellvit.models.cell_segmentation.cellvit_sam_proxy_film import (
+                CellViTSAMProxyFiLM,
+            )
+            fusion_cfg = self.run_conf.get("fusion", {})
+            model_cfg = self.run_conf.get("model", {})
+            transform_cfg = self.run_conf.get("transformations", {})
+            norm_cfg = transform_cfg.get("normalize", {})
+            norm_mean = norm_cfg.get("mean", [0.5, 0.5, 0.5])
+            norm_std = norm_cfg.get("std", [0.5, 0.5, 0.5])
+            film_layers = fusion_cfg.get("film_layers", ["z4"])
+            film_feat_dims = fusion_cfg.get("film_feat_dims", {})
+            if not film_feat_dims and film_layers:
+                film_feat_dims = {k: 1280 for k in film_layers}
+            model = CellViTSAMProxyFiLM(
                 model_path=None,
                 num_nuclei_classes=self.run_conf["data"]["num_nuclei_classes"],
                 num_tissue_classes=self.run_conf["data"]["num_tissue_classes"],
-                vit_structure=self.run_conf["model"].get("backbone", "sam-h"),
-                regression_loss=self.run_conf["model"].get("regression_loss", False),
-                rosie_hidden_dim=self.run_conf["model"].get("rosie_hidden_dim", 256),
-                freeze_cellvit=self.run_conf["model"].get("freeze_cellvit", False),
-                freeze_rosie=self.run_conf["model"].get("freeze_rosie", False),
+                vit_structure=self.sanitize_backbone_for_sam(
+                    model_cfg.get("backbone", "sam-h")
+                ),
+                regression_loss=model_cfg.get("regression_loss", False),
+                film_layers=tuple(film_layers),
+                film_feat_dims=film_feat_dims,
+                film_init=fusion_cfg.get("film_init", "default"),
+                rosie_hidden_dim=model_cfg.get("rosie_hidden_dim", 256),
+                conditioning_mode_train=fusion_cfg.get("conditioning_mode_train", "normal"),
+                conditioning_mode_infer=fusion_cfg.get("conditioning_mode_infer", "normal"),
+                normalize_mean=norm_mean,
+                normalize_std=norm_std,
+            )
+
+        elif model_type == "CellViTSAMRosieEarlyFusion":
+            from cellvit.models.cell_segmentation.cellvit_sam_rosie_early_fusion import CellViTSAMRosieEarlyFusion
+
+            fusion_cfg = self.run_conf.get("fusion", {})
+            model_cfg = self.run_conf.get("model", {})
+            bb = str(model_cfg.get("backbone", "sam-h")).lower()
+            early_type = "vec_broadcast" if "vec" in bb else "map_compress"
+            early_compress = fusion_cfg.get("early_fusion_compress_out_channels", 8)
+
+            model = CellViTSAMRosieEarlyFusion(
+                model_path=None,
+                num_nuclei_classes=self.run_conf["data"]["num_nuclei_classes"],
+                num_tissue_classes=self.run_conf["data"]["num_tissue_classes"],
+                vit_structure="sam-h",
+                regression_loss=model_cfg.get("regression_loss", False),
+                freeze_cellvit=fusion_cfg.get("freeze_cellvit", True),
+                freeze_rosie=fusion_cfg.get("freeze_rosie", True),
+                rosie_weights_path=model_cfg.get("rosie_weights_path", None),
+                early_fusion_type=early_type,
+                early_fusion_compress_out_channels=early_compress,
+                rosie_marker_subset=fusion_cfg.get("rosie_marker_subset"),
+                rosie_marker_subset_indices=fusion_cfg.get("rosie_marker_subset_indices"),
+                early_fusion_detach_rosie=fusion_cfg.get("early_fusion_detach_rosie", True),
+            )
+
+        elif model_type == "CellViTVirchowRosieFiLM":
+            from cellvit.models.cell_segmentation.cellvit_virchow_rosie_film import CellViTVirchowRosieFiLM
+
+            fusion_cfg = self.run_conf.get("fusion", {})
+            model_cfg = self.run_conf.get("model", {})
+
+            virchow_path = model_cfg.get("pretrained_encoder") or model_cfg.get("model_virchow_path")
+            film_enabled = fusion_cfg.get("film_enabled", True)
+            film_layers = fusion_cfg.get("film_layers", ["z4"])
+            film_feat_dims = fusion_cfg.get("film_feat_dims", {})
+
+            # Rosie topk/subset: must match training to get same FiLM input dim (e.g. topk=10 -> 10 channels)
+            rosie_subset_indices = fusion_cfg.get("rosie_subset_indices")
+            rosie_topk = fusion_cfg.get("rosie_topk")
+            rosie_topk_method = fusion_cfg.get("rosie_topk_method", "energy")
+            rosie_topk_cache_path = fusion_cfg.get("rosie_topk_cache_path")
+            if rosie_topk is not None and rosie_topk > 0 and not rosie_topk_cache_path:
+                rosie_topk_cache_path = str(
+                    self.run_dir / f"rosie_topk_cache_{rosie_topk_method}_k{rosie_topk}.json"
+                )
+            rosie_topk_dataset_path = self.run_conf.get("data", {}).get("dataset_path")
+            rosie_topk_seed = self.run_conf.get("random_seed")
+
+            model = CellViTVirchowRosieFiLM(
+                model_virchow_path=virchow_path,
+                num_nuclei_classes=self.run_conf["data"]["num_nuclei_classes"],
+                num_tissue_classes=self.run_conf["data"]["num_tissue_classes"],
+                rosie_hidden_dim=model_cfg.get("rosie_hidden_dim", 256),
+                freeze_rosie=fusion_cfg.get("freeze_rosie", True),
+                rosie_weights_path=model_cfg.get("rosie_weights_path", None),
+                film_enabled=film_enabled,
+                film_layers=tuple(film_layers),
+                film_feat_dims=film_feat_dims,
+                debug_print_z_shapes=fusion_cfg.get("debug_print_z_shapes", False),
+                rosie_subset_indices=rosie_subset_indices,
+                rosie_topk=rosie_topk,
+                rosie_topk_method=rosie_topk_method,
+                rosie_topk_cache_path=rosie_topk_cache_path,
+                rosie_topk_dataset_path=rosie_topk_dataset_path,
+                rosie_topk_seed=rosie_topk_seed,
+                rosie_make_spatial_prior=fusion_cfg.get("rosie_make_spatial_prior", False),
+                rosie_prior_from=fusion_cfg.get("rosie_prior_from", "rosie_backbone"),
+                rosie_prior_channels=int(fusion_cfg.get("rosie_prior_channels", 50)),
             )
 
         return model
@@ -249,11 +528,56 @@ class InferenceCellViT:
         checkpoint = torch.load(
             self.run_dir / "checkpoints" / self.checkpoint_name, map_location="cpu", weights_only=False
         )
-        model = self.get_model(model_type=checkpoint["arch"])
+        state_dict = checkpoint["model_state_dict"]
+
+        # Detect LoRA: config says use_lora, or checkpoint has LoRA keys
+        use_lora = False
+        if checkpoint["arch"] == "CellViTSAMRosieFiLM":
+            model_cfg = self.run_conf.get("model", {})
+            use_lora = model_cfg.get("use_lora", False) or any(
+                "lora_A" in k or "lora_B" in k for k in state_dict
+            )
+
+        if checkpoint["arch"] in ("CellViTSAMRosieFiLM", "CellViTVirchowRosieFiLM", "CellViTSAMProxyFiLM"):
+            fusion = self.run_conf.setdefault("fusion", {})
+            if not fusion.get("film_feat_dims") and not use_lora:
+                inferred = self._infer_film_feat_dims_from_checkpoint(state_dict)
+                if inferred:
+                    fusion["film_feat_dims"] = inferred
+        model = self.get_model(model_type=checkpoint["arch"], use_lora=use_lora)
+        if checkpoint["arch"] == "CellViTSAMRosieEarlyFusion":
+            from cellvit.models.cell_segmentation.cellvit_sam_rosie_early_fusion import expand_input_layer
+            if not getattr(model, "_encoder_expanded", False):
+                expand_input_layer(model.encoder, model.input_channels, "zeros")
+                model._encoder_expanded = True
+        if checkpoint["arch"] == "CellViTSAM" and getattr(model, "input_channels", 3) > 3:
+            from cellvit.models.cell_segmentation.cellvit_sam_rosie_early_fusion import expand_input_layer
+            if not getattr(model, "_encoder_expanded", False):
+                expand_input_layer(model.encoder, model.input_channels, "zeros")
+                model._encoder_expanded = True
+        # Remap film keys only for non-LoRA RosieFiLM (LoRA uses z4_film directly)
+        if not use_lora and any(
+            k.startswith("z1_film.") or k.startswith("z4_film.") for k in state_dict
+        ):
+            state_dict = self._remap_film_checkpoint_keys(state_dict)
         self.logger.info(
             f"Loading best model from {str(self.run_dir / 'checkpoints' / self.checkpoint_name)}"
         )
-        self.logger.info(model.load_state_dict(checkpoint["model_state_dict"]))
+        self.logger.info(model.load_state_dict(state_dict))
+
+        # FiLM conditioning ablations (RosieFiLM + ProxyFiLM)
+        if hasattr(model, "conditioning_mode"):
+            model.conditioning_mode = self.conditioning_mode
+        if hasattr(model, "subset_indices"):
+            model.subset_indices = self.subset_indices
+        if hasattr(model, "conditioning_mode_infer"):
+            model.conditioning_mode_infer = self.conditioning_mode
+        if hasattr(model, "log_film_stats"):
+            model.log_film_stats = self.log_film_stats
+        if hasattr(model, "film_force_identity"):
+            model.film_force_identity = self.film_identity
+        if hasattr(model, "conditioning_mode_infer"):
+            model._infer_debug_conditioning = True
 
         # get dataset
         if test_folds is None:
@@ -292,6 +616,25 @@ class InferenceCellViT:
             transforms=transforms,
         )
 
+        # Subset to specific image IDs when --plot_image_ids is used (for plots-only on high-delta cases)
+        if self.plot_image_ids_set:
+            normalized_ids = {str(x).replace(".png", "").strip() for x in self.plot_image_ids_set}
+            img_names = getattr(inference_dataset, "img_names", None)
+            if img_names is not None:
+                indices = [
+                    i
+                    for i, name in enumerate(img_names)
+                    if name.replace(".png", "").strip() in normalized_ids or name.strip() in self.plot_image_ids_set
+                ]
+                inference_dataset = Subset(inference_dataset, indices)
+                self.logger.info(
+                    f"Subset to {len(indices)} images for --plot_image_ids (of {len(normalized_ids)} requested)"
+                )
+            else:
+                self.logger.warning(
+                    "Dataset has no img_names; --plot_image_ids ignored"
+                )
+
         inference_dataloader = DataLoader(
             inference_dataset,
             batch_size=128,
@@ -302,12 +645,76 @@ class InferenceCellViT:
 
         return model, inference_dataloader, self.dataset_config
 
+    def setup_model_only(
+        self,
+    ) -> tuple[Union[CellViT, CellViT256, CellViTSAM], object, dict]:
+        """Load model and build transforms for single-patch inference only.
+
+        Does NOT create dataset/dataloader; avoids 'Performing Inference on test set' log.
+        Use this for interactive viewers that infer one patch at a time.
+
+        Returns:
+            tuple: (model, transforms, dataset_config)
+        """
+        checkpoint = torch.load(
+            self.run_dir / "checkpoints" / self.checkpoint_name,
+            map_location="cpu",
+            weights_only=False,
+        )
+        state_dict = checkpoint["model_state_dict"]
+
+        # Detect LoRA for CellViTSAMRosieFiLM
+        use_lora = False
+        if checkpoint["arch"] == "CellViTSAMRosieFiLM":
+            model_cfg = self.run_conf.get("model", {})
+            use_lora = model_cfg.get("use_lora", False) or any(
+                "lora_A" in k or "lora_B" in k for k in state_dict
+            )
+
+        if checkpoint["arch"] in ("CellViTSAMRosieFiLM", "CellViTVirchowRosieFiLM", "CellViTSAMProxyFiLM"):
+            fusion = self.run_conf.setdefault("fusion", {})
+            if not fusion.get("film_feat_dims") and not use_lora:
+                inferred = self._infer_film_feat_dims_from_checkpoint(state_dict)
+                if inferred:
+                    fusion["film_feat_dims"] = inferred
+        model = self.get_model(model_type=checkpoint["arch"], use_lora=use_lora)
+        if checkpoint["arch"] == "CellViTSAMRosieEarlyFusion":
+            from cellvit.models.cell_segmentation.cellvit_sam_rosie_early_fusion import expand_input_layer
+            if not getattr(model, "_encoder_expanded", False):
+                expand_input_layer(model.encoder, model.input_channels, "zeros")
+                model._encoder_expanded = True
+        if checkpoint["arch"] == "CellViTSAM" and getattr(model, "input_channels", 3) > 3:
+            from cellvit.models.cell_segmentation.cellvit_sam_rosie_early_fusion import expand_input_layer
+            if not getattr(model, "_encoder_expanded", False):
+                expand_input_layer(model.encoder, model.input_channels, "zeros")
+                model._encoder_expanded = True
+        if not use_lora and any(
+            k.startswith("z1_film.") or k.startswith("z4_film.") for k in state_dict
+        ):
+            state_dict = self._remap_film_checkpoint_keys(state_dict)
+        self.logger.info(
+            f"Loading best model from {str(self.run_dir / 'checkpoints' / self.checkpoint_name)}"
+        )
+        self.logger.info(model.load_state_dict(state_dict))
+
+        transform_settings = self.run_conf["transformations"]
+        if "normalize" in transform_settings:
+            mean = transform_settings["normalize"].get("mean", (0.5, 0.5, 0.5))
+            std = transform_settings["normalize"].get("std", (0.5, 0.5, 0.5))
+        else:
+            mean = (0.5, 0.5, 0.5)
+            std = (0.5, 0.5, 0.5)
+        transforms = A.Compose([A.Normalize(mean=mean, std=std)])
+
+        return model, transforms, self.dataset_config
+
     def run_patch_inference(
         self,
         model: Union[CellViT, CellViT256, CellViTSAM],
         inference_dataloader: DataLoader,
         dataset_config: dict,
         generate_plots: bool = False,
+        plots_only: bool = False,
     ) -> None:
         """Run Patch inference with given setup
 
@@ -322,6 +729,7 @@ class InferenceCellViT:
                     * "tissue_types": describing the present tissue types with corresponding integer
                     * "nuclei_types": describing the present nuclei types with corresponding integer
             generate_plots (bool, optional): If inference plots should be generated. Defaults to False.
+            plots_only (bool, optional): If True, skip writing inference JSON (used with --plot_image_ids to avoid overwriting full results). Defaults to False.
         """
         # put model in eval mode
         model.to(device=self.device)
@@ -350,6 +758,7 @@ class InferenceCellViT:
         )  # the index must exist in `pred_inst_type_all` and unique
         true_inst_type_all_global = []  # each index is 1 independent data point
         pred_inst_type_all_global = []  # each index is 1 independent data point
+        pq_sweep_rows_all = []  # per-image per-threshold rows for CSV when --pq_iou_sweep is used
 
         # for detections scores
         true_idx_offset = 0
@@ -414,8 +823,19 @@ class InferenceCellViT:
                 batch_metrics["unpaired_pred_all"] += pred_idx_offset
                 unpaired_true_all_global.append(batch_metrics["unpaired_true_all"])
                 unpaired_pred_all_global.append(batch_metrics["unpaired_pred_all"])
+                if "pq_sweep_rows" in batch_metrics and batch_metrics["pq_sweep_rows"]:
+                    pq_sweep_rows_all.extend(batch_metrics["pq_sweep_rows"])
 
         # assemble batches to datasets (global)
+        if not image_names:
+            if not plots_only:
+                out_path = self.results_output_dir / f"inference_results_{self.results_suffix}.json"
+                self.logger.warning(f"No batches processed — dataloader may be empty. Saving minimal {out_path.name}.")
+                minimal = {"dataset": {}, "image_metrics": {}, "nuclei_metrics_pq": {}, "nuclei_metrics_d": {}, "tissue_metrics": {}, "note": "empty_run_no_batches"}
+                with open(str(out_path), "w") as f:
+                    json.dump(minimal, f, indent=2)
+            return
+
         tissue_types_inf = [t.lower() for t in tissue_types_inf]
 
         paired_all = np.concatenate(paired_all_global, axis=0)
@@ -567,25 +987,72 @@ class InferenceCellViT:
             )
         )
 
-        # save all folds
-        image_metrics = {}
-        for idx, image_name in enumerate(image_names):
-            image_metrics[image_name] = {
-                "Dice": float(binary_dice_scores[idx]),
-                "Jaccard": float(binary_jaccard_scores[idx]),
-                "bPQ": float(pq_scores[idx]),
+        # save all folds (skip when plots_only to avoid overwriting full inference results)
+        if not plots_only:
+            image_metrics = {}
+            for idx, image_name in enumerate(image_names):
+                image_metrics[image_name] = {
+                    "Dice": float(binary_dice_scores[idx]),
+                    "Jaccard": float(binary_jaccard_scores[idx]),
+                    "bPQ": float(pq_scores[idx]),
+                }
+            all_metrics = {
+                "dataset": dataset_metrics,
+                "tissue_metrics": tissue_metrics,
+                "image_metrics": image_metrics,
+                "nuclei_metrics_pq": nuclei_metrics_pq,
+                "nuclei_metrics_d": nuclei_metrics_d,
             }
-        all_metrics = {
-            "dataset": dataset_metrics,
-            "tissue_metrics": tissue_metrics,
-            "image_metrics": image_metrics,
-            "nuclei_metrics_pq": nuclei_metrics_pq,
-            "nuclei_metrics_d": nuclei_metrics_d,
-        }
+            if self.log_film_stats and hasattr(model, "get_film_stats"):
+                film_stats = model.get_film_stats()
+                if film_stats:
+                    all_metrics["film_stats"] = film_stats
 
-        # saving
-        with open(str(self.run_dir / "inference_results.json"), "w") as outfile:
-            json.dump(all_metrics, outfile, indent=2)
+            # saving
+            out_path = self.results_output_dir / f"inference_results_{self.results_suffix}.json"
+            self.logger.info(f"Saving {out_path.name} to {out_path.resolve()}")
+
+            def _to_native(obj):
+                """Convert numpy types to native Python for JSON serialization."""
+                if isinstance(obj, (np.integer, np.floating)):
+                    return float(obj)
+                if isinstance(obj, np.ndarray):
+                    return obj.tolist()
+                if isinstance(obj, dict):
+                    return {k: _to_native(v) for k, v in obj.items()}
+                if isinstance(obj, (list, tuple)):
+                    return [_to_native(v) for v in obj]
+                return obj
+
+            try:
+                with open(str(out_path), "w") as outfile:
+                    json.dump(_to_native(all_metrics), outfile, indent=2)
+                    outfile.flush()
+                    os.fsync(outfile.fileno())
+                self.logger.info(f"Successfully wrote {out_path}")
+            except Exception as e:
+                self.logger.error(f"Failed to save {out_path.name}: {e}")
+                raise
+
+            # PQ IoU sweep: write per-image per-threshold CSV when --pq_iou_sweep was provided
+            if len(self.pq_iou_thresholds) > 1 and pq_sweep_rows_all:
+                analysis_dir = self.run_dir / "analysis"
+                analysis_dir.mkdir(parents=True, exist_ok=True)
+                csv_path = analysis_dir / "pq_iou_sweep_per_image.csv"
+                try:
+                    with open(csv_path, "w", newline="") as f:
+                        writer = csv.DictWriter(
+                            f,
+                            fieldnames=[
+                                "image_id", "iou_thr", "mpq", "bpq", "dq", "sq",
+                                "n_gt", "n_pred", "n_match",
+                            ],
+                        )
+                        writer.writeheader()
+                        writer.writerows(pq_sweep_rows_all)
+                    self.logger.info(f"Wrote PQ IoU sweep per-image CSV: {csv_path}")
+                except Exception as e:
+                    self.logger.error(f"Failed to save {csv_path.name}: {e}")
 
     def inference_step(
         self,
@@ -629,7 +1096,7 @@ class InferenceCellViT:
                 ground_truth=gt,
                 img_names=image_names,
                 num_nuclei_classes=self.num_classes,
-                outdir=Path(self.run_dir / "inference_predictions"),
+                outdir=Path(self.results_output_dir / "inference_predictions"),
                 scores=scores,
             )
 
@@ -785,6 +1252,7 @@ class InferenceCellViT:
         cell_type_dq_scores = []  # dq-scores per cell type and image
         cell_type_sq_scores = []  # sq-scores per cell type and image
         scores = []  # all scores in one list
+        pq_sweep_rows = []  # (image_id, iou_thr, mpq, bpq, dq, sq, n_gt, n_pred, n_match) for CSV
 
         # detection scores
         paired_all = []  # unique matched index pair
@@ -824,16 +1292,67 @@ class InferenceCellViT:
             binary_jaccard_scores.append(float(cell_jaccard))
 
             # pq values
+            gt_inst_np = np.asarray(
+                instance_maps_gt[i].numpy() if hasattr(instance_maps_gt[i], "numpy") else instance_maps_gt[i]
+            )
             if len(np.unique(instance_maps_gt[i])) == 1:
                 dq, sq, pq = np.nan, np.nan, np.nan
+                if self.debug_pq_remap and i < 5:
+                    print(f"[debug_pq_remap] image {i} ({image_names[i]}): GT empty (single unique), skipping PQ")
+                remapped_instance_pred_empty = binarize(
+                    predictions["instance_types_nuclei"][i][1:].transpose(1, 2, 0)
+                )
+                n_pred_empty = len(np.unique(remapped_instance_pred_empty[remapped_instance_pred_empty > 0]))
+                for thr in self.pq_iou_thresholds:
+                    pq_sweep_rows.append({
+                        "image_id": image_names[i],
+                        "iou_thr": thr,
+                        "mpq": "",
+                        "bpq": "",
+                        "dq": "",
+                        "sq": "",
+                        "n_gt": 0,
+                        "n_pred": n_pred_empty,
+                        "n_match": 0,
+                    })
             else:
                 remapped_instance_pred = binarize(
                     predictions["instance_types_nuclei"][i][1:].transpose(1, 2, 0)
                 )
-                remapped_gt = remap_label(instance_maps_gt[i])
-                [dq, sq, pq], _ = get_fast_pq(
-                    true=remapped_gt, pred=remapped_instance_pred
-                )
+                remapped_gt = remap_label(gt_inst_np)
+                n_gt = len(np.unique(remapped_gt[remapped_gt > 0]))
+                n_pred = len(np.unique(remapped_instance_pred[remapped_instance_pred > 0]))
+                if self.debug_pq_remap and i < 5:
+                    nz_gt = np.unique(gt_inst_np[gt_inst_np > 0])
+                    nz_gt_list = nz_gt.tolist()
+                    nz_pred = np.unique(remapped_instance_pred[remapped_instance_pred > 0])
+                    nz_pred_list = nz_pred.tolist()
+                    print(f"[debug_pq_remap] image {i} ({image_names[i]}):")
+                    print(f"  GT BEFORE remap: max_id={int(np.max(gt_inst_np))} num_inst={len(nz_gt)} first20_ids={nz_gt_list[:20]}")
+                    print(f"  GT AFTER remap:  max_id={int(np.max(remapped_gt))} num_inst={len(np.unique(remapped_gt[remapped_gt>0]))} ids_1..N={np.array_equal(np.unique(remapped_gt[remapped_gt>0]), np.arange(1, len(nz_gt)+1))}")
+                    print(f"  PRED (binarize, no remap): max_id={int(np.max(remapped_instance_pred))} num_inst={len(nz_pred)} first20_ids={nz_pred_list[:20]}")
+                    cont_gt = np.array_equal(np.unique(remapped_gt[remapped_gt > 0]), np.arange(1, len(nz_gt) + 1))
+                    cont_pred = np.array_equal(nz_pred, np.arange(1, len(nz_pred) + 1))
+                    print(f"  contiguous_gt={cont_gt} contiguous_pred={cont_pred}")
+                dq, sq, pq = np.nan, np.nan, np.nan
+                for thr in self.pq_iou_thresholds:
+                    [dq_thr, sq_thr, pq_thr], pairing = get_fast_pq(
+                        true=remapped_gt, pred=remapped_instance_pred, match_iou=thr
+                    )
+                    n_match = len(pairing[0])
+                    pq_sweep_rows.append({
+                        "image_id": image_names[i],
+                        "iou_thr": thr,
+                        "mpq": float(pq_thr) if not np.isnan(pq_thr) else "",
+                        "bpq": float(pq_thr) if not np.isnan(pq_thr) else "",
+                        "dq": float(dq_thr) if not np.isnan(dq_thr) else "",
+                        "sq": float(sq_thr) if not np.isnan(sq_thr) else "",
+                        "n_gt": n_gt,
+                        "n_pred": n_pred,
+                        "n_match": n_match,
+                    })
+                    if thr == self.pq_iou_thr:
+                        dq, sq, pq = dq_thr, sq_thr, pq_thr
             pq_scores.append(pq)
             dq_scores.append(dq)
             sq_scores.append(sq)
@@ -866,7 +1385,7 @@ class InferenceCellViT:
                     [dq_tmp, sq_tmp, pq_tmp], _ = get_fast_pq(
                         pred_nuclei_instance_class,
                         target_nuclei_instance_class,
-                        match_iou=0.5,
+                        match_iou=self.pq_iou_thr,
                     )
                 nuclei_type_pq.append(pq_tmp)
                 nuclei_type_dq.append(dq_tmp)
@@ -946,6 +1465,7 @@ class InferenceCellViT:
             "unpaired_pred_all": unpaired_pred_all,
             "true_inst_type_all": true_inst_type_all,
             "pred_inst_type_all": pred_inst_type_all,
+            "pq_sweep_rows": pq_sweep_rows,
         }
 
         return batch_metrics, scores
@@ -986,8 +1506,9 @@ class InferenceCellViT:
         outdir = Path(outdir)
         outdir.mkdir(exist_ok=True, parents=True)
 
-        h = ground_truth["hv_map"].shape[1]
-        w = ground_truth["hv_map"].shape[2]
+        # ground_truth and predictions are DataclassHVStorage (attribute access, not subscript)
+        # Use instance_map for spatial dims (B, H, W); hv_map may be (B, 2, H, W) or (B, H, W, 2)
+        h, w = ground_truth.instance_map.shape[1], ground_truth.instance_map.shape[2]
 
         # convert to rgb and crop to selection
         sample_images = (
@@ -995,24 +1516,35 @@ class InferenceCellViT:
         )  # convert to rgb
         sample_images = cropping_center(sample_images, (h, w), True)
 
+        # nuclei_binary_map: (B, 2, H, W), take foreground channel
         pred_sample_binary_map = (
-            predictions["nuclei_binary_map"][:, :, :, 1].detach().cpu().numpy()
+            predictions.nuclei_binary_map[:, 1, :, :].detach().cpu().numpy()
         )
-        pred_sample_hv_map = predictions["hv_map"].detach().cpu().numpy()
-        pred_sample_instance_maps = predictions["instance_map"].detach().cpu().numpy()
+        # hv_map: model outputs (B, 2, H, W), normalize to (B, H, W, 2) for indexing
+        pred_sample_hv_map = predictions.hv_map.detach().cpu().numpy()
+        if pred_sample_hv_map.ndim == 4 and pred_sample_hv_map.shape[1] == 2:
+            pred_sample_hv_map = np.transpose(pred_sample_hv_map, (0, 2, 3, 1))
+        pred_sample_instance_maps = predictions.instance_map.detach().cpu().numpy()
+        # nuclei_type_map: (B, num_classes, H, W)
         pred_sample_type_maps = (
-            torch.argmax(predictions["nuclei_type_map"], dim=-1).detach().cpu().numpy()
+            torch.argmax(predictions.nuclei_type_map, dim=1).detach().cpu().numpy()
         )
 
         # get ground truth labels
-        # gt_sample_binary_map = (
-        #     torch.argmax(ground_truth["nuclei_binary_map"], dim=-1).detach().cpu()
-        # )
-        gt_sample_binary_map = ground_truth["nuclei_binary_map"].detach().cpu().numpy()
-        gt_sample_hv_map = ground_truth["hv_map"].detach().cpu().numpy()
-        gt_sample_instance_map = ground_truth["instance_map"].detach().cpu().numpy()
+        # nuclei_binary_map: (B, 2, H, W) from unpack_masks, or (B, H, W) if calculate_step_metric already ran (argmax)
+        gt_nbm = ground_truth.nuclei_binary_map.detach().cpu()
+        if gt_nbm.dim() == 4:
+            gt_sample_binary_map = gt_nbm[:, 1, :, :].numpy()
+        else:
+            gt_sample_binary_map = gt_nbm.numpy()
+        # hv_map: gt from masks is (B, H, W, 2); ensure (B, H, W, 2) for indexing
+        gt_sample_hv_map = ground_truth.hv_map.detach().cpu().numpy()
+        if gt_sample_hv_map.ndim == 4 and gt_sample_hv_map.shape[1] == 2:
+            gt_sample_hv_map = np.transpose(gt_sample_hv_map, (0, 2, 3, 1))
+        gt_sample_instance_map = ground_truth.instance_map.detach().cpu().numpy()
+        # nuclei_type_map: (B, num_classes, H, W)
         gt_sample_type_map = (
-            torch.argmax(ground_truth["nuclei_type_map"], dim=-1).detach().cpu().numpy()
+            torch.argmax(ground_truth.nuclei_type_map, dim=1).detach().cpu().numpy()
         )
 
         # create colormaps
@@ -1095,14 +1627,14 @@ class InferenceCellViT:
             # contours
             # gt
             gt_contours_polygon = [
-                v["contour"] for v in ground_truth["instance_types"][i].values()
+                v["contour"] for v in ground_truth.instance_types[i].values()
             ]
             gt_contours_polygon = [
                 list(zip(poly[:, 0], poly[:, 1])) for poly in gt_contours_polygon
             ]
             gt_contour_colors_polygon = [
                 cell_colors[v["type"]]
-                for v in ground_truth["instance_types"][i].values()
+                for v in ground_truth.instance_types[i].values()
             ]
             gt_cell_image = Image.fromarray(
                 (sample_images[i] * 255).astype(np.uint8)
@@ -1119,14 +1651,14 @@ class InferenceCellViT:
             placeholder[:h, 6 * w : 7 * w, :3] = np.asarray(gt_cell_image) / 255
             # pred
             pred_contours_polygon = [
-                v["contour"] for v in predictions["instance_types"][i].values()
+                v["contour"] for v in predictions.instance_types[i].values()
             ]
             pred_contours_polygon = [
                 list(zip(poly[:, 0], poly[:, 1])) for poly in pred_contours_polygon
             ]
             pred_contour_colors_polygon = [
                 cell_colors[v["type"]]
-                for v in predictions["instance_types"][i].values()
+                for v in predictions.instance_types[i].values()
             ]
             pred_cell_image = Image.fromarray(
                 (sample_images[i] * 255).astype(np.uint8)
@@ -1187,11 +1719,28 @@ class InferenceCellViT:
 
 
 # CLI
+#
+# Example inference with --film_force_identity (gamma=1, beta=0 ablation; outputs to results_film_identity/):
+#
+#   VirchowRosieFiLM:
+#   python -m cellvit.training.evaluate.inference_cellvit_experiment_pannuke \
+#     --run_dir /projectnb/ec500kb/projects/Fall_2025_Projects/Project_2/AI-guided-whole-slide-imaging-analysis/AI-GUIDED-CLEAN/ProcessedDataset/v1_40x_area20_2/patches_cellvit_p256/trainings_idinit/2026-02-23T014746_VirchowRosieFiLM-z4-idinit-lr3e5-TCGA-seed19 \
+#     --film_force_identity --gpu 0
+#
+#   SAMHRosieFiLM:
+#   python -m cellvit.training.evaluate.inference_cellvit_experiment_pannuke \
+#     --run_dir /projectnb/ec500kb/projects/Fall_2025_Projects/Project_2/AI-guided-whole-slide-imaging-analysis/AI-GUIDED-CLEAN/ProcessedDataset/v1_40x_area20_2/patches_cellvit_p256/trainings_idinit/2026-02-23T033732_SAMHRosieFiLM-z4-idinit-lr3e5-TCGA-seed19 \
+#     --film_force_identity --gpu 0
+#
 class InferenceCellViTParser:
     def __init__(self) -> None:
         parser = argparse.ArgumentParser(
             formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-            description="Perform CellViT inference for given run-directory with model checkpoints and logs",
+            description=(
+                "Perform CellViT inference for given run-directory with model checkpoints and logs. "
+                "PQ instance matching uses IoU >= threshold to count a prediction as a true positive; "
+                "higher thresholds are stricter (fewer matches, lower PQ)."
+            ),
         )
 
         parser.add_argument(
@@ -1223,6 +1772,68 @@ class InferenceCellViTParser:
             action="store_true",
             help="Generate inference plots in run_dir",
         )
+        parser.add_argument(
+            "--plot_image_ids",
+            type=str,
+            default=None,
+            help="Path to file with one image ID per line. When used with --plots, only these images are inferred and plotted (avoids full re-run for high-delta cases).",
+        )
+        parser.add_argument(
+            "--plots_only",
+            action="store_true",
+            help="Used with --plot_image_ids: generate plots only, skip writing inference JSON (avoids overwriting full results).",
+        )
+        parser.add_argument(
+            "--conditioning_mode",
+            type=str,
+            choices=["normal", "zeros", "shuffle", "subset9"],
+            default="normal",
+            help="FiLM conditioning ablation: normal, zeros, shuffle, subset9",
+        )
+        parser.add_argument(
+            "--subset_indices",
+            type=str,
+            default="",
+            help='For subset9 mode: comma-separated indices e.g. "1,5,9"',
+        )
+        parser.add_argument(
+            "--log_film_stats",
+            action="store_true",
+            help="Accumulate and log FiLM gamma/beta statistics",
+        )
+        parser.add_argument(
+            "--results_suffix",
+            type=str,
+            default=None,
+            help="Suffix for inference_results filename (default: conditioning_mode or identity)",
+        )
+        parser.add_argument(
+            "--film_identity",
+            action="store_true",
+            help="Force FiLM to identity (gamma=1, beta=0) during inference (alias for --film_force_identity)",
+        )
+        parser.add_argument(
+            "--film_force_identity",
+            action="store_true",
+            help="Force FiLM to identity (gamma=1, beta=0) at every FiLM application. Saves to results_film_identity/. Baseline and no-FiLM models unaffected.",
+        )
+        parser.add_argument(
+            "--debug_pq_remap",
+            action="store_true",
+            help="For first 5 images: print GT/pred inst stats before/after remap and contiguous check",
+        )
+        parser.add_argument(
+            "--pq_iou_thr",
+            type=float,
+            default=0.5,
+            help="IoU threshold for PQ instance matching (pred–GT pair counts as TP if IoU > thr). Used for reported metrics and, if --pq_iou_sweep is not set, as the only threshold.",
+        )
+        parser.add_argument(
+            "--pq_iou_sweep",
+            type=str,
+            default=None,
+            help='Comma-separated IoU thresholds to sweep (e.g. "0.3,0.4,0.5,0.6"). When set, per-image metrics for each threshold are written to run_dir/analysis/pq_iou_sweep_per_image.csv. Reported metrics still use --pq_iou_thr.',
+        )
 
         self.parser = parser
 
@@ -1240,9 +1851,23 @@ if __name__ == "__main__":
         checkpoint_name=configuration["checkpoint_name"],
         gpu=configuration["gpu"],
         magnification=configuration["magnification"],
+        conditioning_mode=configuration.get("conditioning_mode", "normal"),
+        subset_indices=configuration.get("subset_indices", ""),
+        log_film_stats=configuration.get("log_film_stats", False),
+        results_suffix=configuration.get("results_suffix"),
+        film_identity=configuration.get("film_identity", False),
+        film_force_identity=configuration.get("film_force_identity", False),
+        plot_image_ids=configuration.get("plot_image_ids"),
+        debug_pq_remap=configuration.get("debug_pq_remap", False),
+        pq_iou_thr=configuration.get("pq_iou_thr", 0.5),
+        pq_iou_sweep=configuration.get("pq_iou_sweep"),
     )
     model, dataloader, conf = inf.setup_patch_inference()
 
     inf.run_patch_inference(
-        model, dataloader, conf, generate_plots=configuration["plots"]
+        model,
+        dataloader,
+        conf,
+        generate_plots=configuration["plots"],
+        plots_only=configuration.get("plots_only", False),
     )
