@@ -2,14 +2,85 @@
 
 This repository documents **inference**, **Docker/Singularity deployment**, and **training** workflows for the **CellViT + SAM-H + Rosie FiLM fusion model**.
 
+**Paths in examples:** Replace `/path/to/repo` with the path to this repository (AI-GUIDED-CLEAN). Use `/path/to/run_dir` for a training run directory, `/path/to/patches/images` for an image folder, etc., as needed.
+
 ---
 
-## 1. Inference (Local Python Environment)
+## 1. Easy inference (PanNuke-style patch evaluation)
+
+Run inference on a **PanNuke-style test fold** (folder of images + labels). The script uses the run directory of a trained model (checkpoints + `config.yaml`). You can vary FiLM conditioning for ablations.
+
+**Script:** `CellViT-plus-plus/cellvit/training/evaluate/inference_cellvit_experiment_pannuke.py`
+
+**Example: normal conditioning (default)**
+
+```bash
+python CellViT-plus-plus/cellvit/training/evaluate/inference_cellvit_experiment_pannuke.py \
+  --run_dir "/path/to/run_dir" \
+  --gpu 0 \
+  --conditioning_mode normal \
+  --log_film_stats
+```
+
+**Example: zeros conditioning (FiLM inputs set to zero)**
+
+```bash
+python CellViT-plus-plus/cellvit/training/evaluate/inference_cellvit_experiment_pannuke.py \
+  --run_dir "/path/to/run_dir" \
+  --gpu 0 \
+  --conditioning_mode zeros \
+  --results_suffix zeros \
+  --log_film_stats
+```
+
+**Example: shuffle conditioning (FiLM inputs shuffled)**
+
+```bash
+python CellViT-plus-plus/cellvit/training/evaluate/inference_cellvit_experiment_pannuke.py \
+  --run_dir "/path/to/run_dir" \
+  --gpu 0 \
+  --conditioning_mode shuffle \
+  --results_suffix shuffle \
+  --log_film_stats
+```
+
+Results are written under `run_dir` (e.g. `inference_results_normal.json`, `inference_results_zeros.json`, `inference_results_shuffle.json`). Set `--run_dir` to your training run directory (the folder that contains `checkpoints/` and `config.yaml`).
+
+---
+
+## 2. WSI-level inference (whole slide)
+
+For **whole-slide images** (e.g. `.svs`), use `detect_cells.py` with the **checkpoint file** (`.pth`) from a training run. Run from the `CellViT-plus-plus` directory so that `cellvit` is on the path.
+
+**Script:** `CellViT-plus-plus/cellvit/detect_cells.py`
+
+**Example: single WSI**
+
+```bash
+cd CellViT-plus-plus
+
+python cellvit/detect_cells.py \
+  --model /path/to/run_dir/checkpoints/model_best.pth \
+  --outdir ./wsi_inference_output \
+  --gpu 0 \
+  --resolution 0.25 \
+  --batch_size 8 \
+  --geojson \
+  --enforce_amp \
+  process_wsi \
+  --wsi_path /path/to/slide.svs
+```
+
+Outputs (cells, detection, optional GeoJSON) are written under `--outdir`. Use `process_dataset` with `--wsi_folder` or `--filelist` to run on multiple slides; see `python cellvit/detect_cells.py --help`.
+
+---
+
+## 3. Inference (Local Python Environment, legacy patch script)
 
 Input: Folder consisting of 256x256 RGB lung tissue H&E images (preferably png).
 Output: The predictions, including type maps, binary maps and cell classifications overlays with legends.
 
-### 1.1 Create and Activate Environment
+### 3.1 Create and Activate Environment
 
 ```bash
 source cellvit_inf_env/bin/activate
@@ -17,18 +88,18 @@ pip install --upgrade pip
 pip install -r requirements_inference.txt
 ```
 
-### 1.2 Run Inference
+### 3.2 Run Inference
 
 ```bash
 python cellvit_rosie_film_inference.py \
-  --input_dir /projectnb/ec500kb/projects/Fall_2025_Projects/Project_2/AI-guided-whole-slide-imaging-analysis/AI-GUIDED-CLEAN/ProcessedDataset/v1_40x_area20_2/patches_cellvit_p256_pannuke/fold1/images \
+  --input_dir /path/to/patches/images \
   --output_dir ./cellvit_inference_results_film256 \
-  --run_dir /projectnb/ec500kb/projects/Fall_2025_Projects/Project_2/AI-guided-whole-slide-imaging-analysis/AI-GUIDED-CLEAN/ProcessedDataset/v1_40x_area20_2/patches_cellvit_p256_pannuke/logs_local_berk/2025-12-05T191217_film256 \
+  --run_dir /path/to/run_dir \
   --checkpoint model_best.pth \
   --magnification 40
 ```
 
-### 1.3 Model Weights
+### 3.3 Model Weights
 
 The contents of `2025-12-05T191217_film256` can be found on HuggingFace:
 
@@ -38,9 +109,9 @@ BerkTuzcuBU/SamH-Rosie-FiLM-256
 
 ---
 
-## 2. Docker Inference
+## 4. Docker Inference
 
-### 2.1 Build Docker Image
+### 4.1 Build Docker Image
 
 ```bash
 docker buildx build \
@@ -50,7 +121,7 @@ docker buildx build \
   .
 ```
 
-### 2.2 Run with Local `run_dir`
+### 4.2 Run with Local `run_dir`
 
 ```bash
 docker run --rm --gpus all \
@@ -60,7 +131,7 @@ docker run --rm --gpus all \
   cellvit-inference-amd64
 ```
 
-### 2.3 Run Using HuggingFace Checkpoints
+### 4.3 Run Using HuggingFace Checkpoints
 
 ```bash
 docker run --rm --gpus all \
@@ -74,16 +145,16 @@ Note: When `HF_REPO` is set, the local `run_dir` is ignored.
 
 ---
 
-## 3. Singularity (SCC / HPC)
+## 5. Singularity (SCC / HPC)
 
-### 3.1 Convert Docker Image
+### 5.1 Convert Docker Image
 
 ```bash
 docker save cellvit-inference-amd64 > cellvit-inference.tar
 singularity build cellvit-inference.sif docker-archive://cellvit-inference.tar
 ```
 
-### 3.2 Run Inference with Singularity
+### 5.2 Run Inference with Singularity
 
 Singularity **does not create output directories automatically**.
 
@@ -91,17 +162,17 @@ Singularity **does not create output directories automatically**.
 mkdir -p ./cellvit_inference_results_film256
 
 singularity run --nv \
-  -B /projectnb/ec500kb/projects/Fall_2025_Projects/Project_2/AI-guided-whole-slide-imaging-analysis/AI-GUIDED-CLEAN/ProcessedDataset/v1_40x_area20_2/patches_cellvit_p256_pannuke/fold1/images:/data/input \
-  -B /projectnb/ec500kb/projects/Fall_2025_Projects/Project_2/AI-guided-whole-slide-imaging-analysis/AI-GUIDED-CLEAN/ProcessedDataset/v1_40x_area20_2/patches_cellvit_p256_pannuke/logs_local_berk/2025-12-05T191217_film256:/data/run \
+  -B /path/to/patches/images:/data/input \
+  -B /path/to/run_dir:/data/run \
   -B $(pwd)/cellvit_inference_results_film256:/data/output \
   cellvit-inference.sif
 ```
 
 ---
 
-## 4. Training (CellViT Original Pipeline)
+## 6. Training (CellViT Original Pipeline)
 
-### 4.1 Environment Setup on SCC
+### 6.1 Environment Setup on SCC
 
 ```bash
 cd CellViT-plus-plus
@@ -117,7 +188,7 @@ conda activate cellvit_env
 pip install -r requirements.txt
 ```
 
-### 4.2 GPU & CUDA Checks
+### 6.2 GPU & CUDA Checks
 
 ```bash
 lspci | grep -i nvidia
@@ -135,13 +206,13 @@ pip install torch==2.2.2 torchvision==0.17.2 torchaudio==2.2.2 \
   --index-url https://download.pytorch.org/whl/cu121
 ```
 
-### 4.3 libvips (Required)
+### 6.3 libvips (Required)
 
 ```bash
 module load libvips/8.13.0
 ```
 
-### 4.4 Sanity Check
+### 6.4 Sanity Check
 
 ```bash
 python3 check_environment.py
@@ -149,29 +220,74 @@ python3 check_environment.py
 
 ---
 
-## 5. Dataset Structure (Training)
+## 7. Dataset structure for training (PanNuke-style)
+
+Training expects a **PanNuke-style dataset**: one folder per fold, with images and labels. Create a dataset root (e.g. `pannuke_hf_cellvit`) and inside it:
+
+- **`fold0/`**, **`fold1/`**, **`fold2/`** (or more): each fold contains  
+  - **`images/`** — RGB patches (e.g. `.png`), one file per sample  
+  - **`labels/`** — one `.npy` per image, same stem as in `images/` (instance map, nuclei types, etc.; see CellViT/PanNuke docs)  
+  - **`types.csv`** — column `img` (filename) and `type` (tissue type per image)  
+  - **`cell_count.csv`** (optional) — per-image cell counts for sampling
+
+Example layout:
 
 ```
-ProcessedDataset/
+pannuke_hf_cellvit/
 ├── fold0/
+│   ├── images/
+│   │   ├── image_001.png
+│   │   └── ...
+│   ├── labels/
+│   │   ├── image_001.npy
+│   │   └── ...
+│   ├── types.csv
+│   └── cell_count.csv
 ├── fold1/
-├── train_configs/
-├── dataset_config.yaml
+│   ├── images/
+│   ├── labels/
+│   ├── types.csv
+│   └── cell_count.csv
+├── fold2/
+│   └── ...
+└── train_configs/
+    └── cellvit_segmentation_virchow_rosie_film.yaml
 ```
 
-Folds are mapped to train/val/test via config files.
+In the **training config YAML** you set `data.dataset_path` to this root and `data.train_folds`, `data.val_folds`, `data.test_folds` to the fold indices (e.g. `[0]`, `[1]`, `[2]`). Section 8 lists the main config keys and how to run training.
 
 ---
 
-## 6. Training Commands
+## 8. Training commands
 
-Run from:
+1. **Create a training config** (YAML) in your dataset’s `train_configs/` folder. Minimal example for Virchow + ROSIE FiLM:
+
+   - `data.dataset_path`: path to the PanNuke-style root (with `fold0/`, `fold1/`, …)  
+   - `data.train_folds`, `data.val_folds`, `data.test_folds`: e.g. `[0]`, `[1]`, `[2]`  
+   - `model.backbone`: e.g. `virchow-rosie-film`  
+   - `model.pretrained_encoder`: path to Virchow encoder  
+   - `model.rosie_weights_path`: path to ROSIE weights  
+   - `fusion.film_enabled`, `fusion.film_layers`, etc.  
+   - `training.batch_size`, `training.optimizer_hyperparameter.lr`, etc.
+
+   You can copy and adapt an existing run’s `config.yaml` from a training output directory (e.g. under `trainings/<run_name>/config.yaml`) or use a config from `ProcessedDataset/.../train_configs/` in this repo as a template.
+
+2. **Run training** from the dataset root (parent of `train_configs/`), pointing at your config:
 
 ```bash
-cd /projectnb/ec500kb/projects/Fall_2025_Projects/Project_2/AI-guided-whole-slide-imaging-analysis/AI-GUIDED-CLEAN/ProcessedDataset/v1_40x_area20_2
+cd /path/to/your/pannuke_dataset_root
+
+python /path/to/repo/CellViT-plus-plus/cellvit/train_cellvit.py \
+  --config ./train_configs/your_config.yaml
 ```
 
-### 6.1 Patch Size 128
+Example if your dataset and configs live under a `ProcessedDataset`-style layout inside the repo:
+
+```bash
+cd /path/to/repo/ProcessedDataset/your_dataset_folder
+```
+
+### 8.1 Patch size 128
 
 ```bash
 python3 ../../CellViT-plus-plus/cellvit/train_cellvit.py \
@@ -192,7 +308,7 @@ python3 ../../CellViT-plus-plus/cellvit/train_cellvit.py \
   --config ./patches_cellvit_p128_pannuke/train_configs/samh_rosie_film.yaml
 ```
 
-### 6.2 Patch Size 256
+### 8.2 Patch size 256
 
 ```bash
 python3 ../../CellViT-plus-plus/cellvit/train_cellvit.py \
@@ -215,16 +331,16 @@ python3 ../../CellViT-plus-plus/cellvit/train_cellvit.py \
 
 ---
 
-## 7. Notes
+## 9. Notes
 
-* For full WSI inference via `detect_cells.py`, functionality is **experimental and still under development**.
-* For additional details, refer to the original **CellViT README.md**.
+* WSI inference via `detect_cells.py` (Section 2) is supported for single slides and batch processing; use `--geojson` for QuPath-compatible output.
+* For additional details, refer to the original **CellViT README.md** in `CellViT-plus-plus`.
 
-## Docker Inference
+## 10. Docker inference (detailed)
 
-This section explains how to build and run the CellViT FiLM inference container using Docker. The Docker image is intended primarily for local testing and for conversion to Singularity on HPC systems.
+This section explains how to build and run the CellViT FiLM inference container using Docker. The Docker image is intended primarily for local testing and for conversion to Singularity on HPC systems. See **Section 4** for a short version.
 
-### Build the Docker Image
+### 10.1 Build the Docker image
 
 From the root of the repository (where the Dockerfile and `requirements_inference.txt` are located):
 
@@ -241,7 +357,7 @@ Notes:
 * `--platform linux/amd64` is required when building on Apple Silicon (arm64) machines.
 * The image includes only inference-time dependencies.
 
-### Run with Local `run_dir`
+### 10.2 Run with local `run_dir`
 
 ```bash
 docker run --rm --gpus all \
@@ -257,7 +373,7 @@ Expected container paths:
 * `/data/output`  : directory where inference outputs will be written
 * `/data/run`     : CellViT run directory containing `checkpoints/model_best.pth`
 
-### Run Using a HuggingFace Checkpoint
+### 10.3 Run using a HuggingFace checkpoint
 
 If you prefer to load the model directly from HuggingFace instead of a local `run_dir`:
 
@@ -283,4 +399,4 @@ docker save cellvit-inference-amd64 > cellvit-inference.tar
 singularity build cellvit-inference.sif docker-archive://cellvit-inference.tar
 ```
 
-After conversion, see the **Singularity Inference** section for execution instructions.
+After conversion, see **Section 5** (Singularity) for execution instructions.

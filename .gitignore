@@ -207,19 +207,37 @@ marimo/_lsp/
 __marimo__/
 
 
+# Image / slide / binary — do not commit (commit only .py, .yaml, .csv, .txt, etc.)
 *.png
 *.jpg
 *.jpeg
-*.csv
+*.gif
+*.tif
+*.tiff
+*.svs
+*.ndpi
+*.scn
+*.vms
+*.bif
 *.npy
-
-!ProcessedDataset/**/train_configs/*.yaml
-!ProcessedDataset/**/*.yaml
-!ProcessedDataset/**/*.txt
-!ProcessedDataset/**/.gitkeep
+*.h5
 
 # Ignore model weights and checkpoints
 *.pth
 *.pt
+*.ckpt
 checkpoints/
 **/checkpoints/*.pth
+
+# Generated / large artifacts
+ProcessedDataset/
+wandb/
+*.wandb
+*.zip
+*.mov
+
+# Allow specific config/data in ProcessedDataset (yaml, txt, csv are committed)
+!ProcessedDataset/**/train_configs/*.yaml
+!ProcessedDataset/**/*.yaml
+!ProcessedDataset/**/*.txt
+!ProcessedDataset/**/.gitkeep
